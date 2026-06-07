@@ -6,6 +6,7 @@ set -euo pipefail
 SPLIT="${1:-dev_small64}"
 ADAPTER_PATH="${2:-null}"
 EXPERIMENT_NAME="${3:-}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PATH="$PWD/appworld-env/bin:$PATH"
@@ -19,7 +20,7 @@ if [[ -z "$EXPERIMENT_NAME" ]]; then
   fi
 fi
 
-python -m scripts.run_appworld_inference \
+"$PYTHON_BIN" -m scripts.run_appworld_inference \
   experiment_name="$EXPERIMENT_NAME" \
   llm=qwen_2_5_7b_eval \
   llm.adapter_path="$ADAPTER_PATH" \
@@ -31,8 +32,8 @@ python -m scripts.run_appworld_inference \
   llm.vllm_class.max_new_tokens=1200 \
   "${@:4}"
 
-python -m scripts.appworld_eval_parse_and_log \
+"$PYTHON_BIN" -m scripts.appworld_eval_parse_and_log \
   experiment_name="$EXPERIMENT_NAME" \
   scenario_sampler.dataset_name="$SPLIT"
 
-python -m scripts.summarize_appworld_episodes "$EXPERIMENT_NAME"
+"$PYTHON_BIN" -m scripts.summarize_appworld_episodes "$EXPERIMENT_NAME"
