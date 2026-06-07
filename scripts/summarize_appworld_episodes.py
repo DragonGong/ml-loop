@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_INVALID_API_PATTERNS = (
     r"invalid api",
     r"api .* not found",

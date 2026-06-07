@@ -12,7 +12,6 @@ import os
 import random
 from pathlib import Path
 
-
 DEFAULT_TRAIN_SOURCES = ("train_difficulty_1", "train_difficulty_2")
 
 
