@@ -200,9 +200,13 @@ def flatten_module_containers(modules: Iterable[nn.Module]) -> list[nn.Module]:
 
 def get_auto_wrap_policy_type(fsdp2_plugin: FullyShardedDataParallelPlugin) -> str:
     """Determine the auto wrap policy type from the FSDP2 plugin."""
-    if fsdp2_plugin.auto_wrap_policy is transformer_auto_wrap_policy:
+    policy = fsdp2_plugin.auto_wrap_policy
+    if isinstance(policy, functools.partial):
+        policy = policy.func
+
+    if policy is transformer_auto_wrap_policy:
         return "transformer"
-    elif fsdp2_plugin.auto_wrap_policy is size_based_auto_wrap_policy:
+    elif policy is size_based_auto_wrap_policy:
         return "size"
     else:
         raise ValueError(f"Unknown auto_wrap_policy: {fsdp2_plugin.auto_wrap_policy!r}")
