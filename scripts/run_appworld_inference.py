@@ -68,7 +68,7 @@ def main(cfg: MainInferenceConfig) -> None:
             barrier=torch_dist_barrier,
             inference_gpus=list(range(torch.cuda.device_count())),
             exclusive_inference_and_learning=False,
-            max_gpu_mem_utilization=None,
+            max_gpu_mem_utilization=cfg.llm.max_gpu_mem_utilization,
             num_runners=cfg.num_scenario_runners,
             llm_cfg=cfg.llm,
         )
