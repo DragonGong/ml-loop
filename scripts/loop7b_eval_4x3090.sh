@@ -25,9 +25,11 @@ python -m scripts.run_appworld_inference \
   llm.adapter_path="$ADAPTER_PATH" \
   scenario_sampler.dataset_name="$SPLIT" \
   num_scenario_runners=16 \
+  llm.max_gpu_mem_utilization="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}" \
   llm.vllm_server.gpus_per_vllm_server=1 \
   llm.vllm_server.max_model_len=16384 \
-  llm.vllm_class.max_new_tokens=1200
+  llm.vllm_class.max_new_tokens=1200 \
+  "${@:4}"
 
 python -m scripts.appworld_eval_parse_and_log \
   experiment_name="$EXPERIMENT_NAME" \

@@ -39,7 +39,9 @@ accelerate launch \
   llm.vllm_class.max_new_tokens=1200 \
   llm.vllm_server.gpus_per_vllm_server=1 \
   rl.num_scenario_runners=4 \
-  rl.inference_requires_memory_gb=32 \
+  llm.max_gpu_mem_utilization=0.72 \
+  rl.inference_requires_memory_gb=64 \
   rl.learning_requires_memory_gb=56 \
   rl.max_ckpts=10 \
-  rl.stress_test_iters=1
+  rl.stress_test_iters=1 \
+  "$@"
