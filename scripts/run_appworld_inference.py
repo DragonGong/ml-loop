@@ -6,6 +6,7 @@
 """Run inference on AppWorld tasks."""
 
 import itertools
+import os
 import shutil
 import threading
 from pathlib import Path
@@ -30,6 +31,16 @@ from phi_agents.utils.utils import torch_dist_barrier
 from phi_agents.visualization.rollouts import convert_rollout_to_episode
 
 logger = get_phi_logger()
+
+
+def _inference_gpu_ids() -> list[int]:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        devices = [device.strip() for device in visible_devices.split(",") if device.strip()]
+        if devices and all(device.isdigit() for device in devices):
+            return [int(device) for device in devices]
+
+    return list(range(torch.cuda.device_count()))
 
 
 @hydra.main(version_base=None, config_path="../phi_agents/rl/conf", config_name="appworld_eval")  # type: ignore[misc]
@@ -66,7 +77,7 @@ def main(cfg: MainInferenceConfig) -> None:
             rank=0,
             local_rank=0,
             barrier=torch_dist_barrier,
-            inference_gpus=list(range(torch.cuda.device_count())),
+            inference_gpus=_inference_gpu_ids(),
             exclusive_inference_and_learning=False,
             max_gpu_mem_utilization=cfg.llm.max_gpu_mem_utilization,
             num_runners=cfg.num_scenario_runners,
