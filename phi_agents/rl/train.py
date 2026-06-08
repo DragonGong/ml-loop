@@ -343,7 +343,7 @@ class RLOOTrainer:
             self._exclusive_inference_and_learning = inference_and_learning_share_gpus(
                 self._cfg.gpu_allocation.inference_gpus, self._cfg.gpu_allocation.learning_gpus
             )
-            _inference_max_mem_utilization = None
+            _inference_max_mem_utilization = self._llm_cfg.max_gpu_mem_utilization
             _learning_max_mem_utilization = None
 
         # Limit the max mem utilization for learning
