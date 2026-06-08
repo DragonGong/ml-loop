@@ -434,12 +434,12 @@ def _run_base_if_needed(args: argparse.Namespace) -> None:
 def _checkpoint_paths(args: argparse.Namespace) -> list[Path]:
     if args.checkpoint_root is None:
         return []
-    paths = []
-    paths = sorted(
+    candidates = sorted(
         args.checkpoint_root.glob("checkpoint-*"),
         key=lambda item: _checkpoint_iteration(item) or -1,
     )
-    for path in paths:
+    paths = []
+    for path in candidates:
         iteration = _checkpoint_iteration(path)
         if iteration is None or iteration % args.eval_every != 0:
             continue
