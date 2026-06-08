@@ -44,7 +44,7 @@ def _inference_gpu_ids() -> list[int]:
     return list(range(torch.cuda.device_count()))
 
 
-@hydra.main(version_base=None, config_path="../phi_agents/rl/conf", config_name="appworld_eval")  # type: ignore[misc]
+@hydra.main(version_base=None, config_path="../../phi_agents/rl/conf", config_name="appworld_eval")  # type: ignore[misc]
 def main(cfg: MainInferenceConfig) -> None:
     """Run inference."""
     rl_config.register_hydra_resolvers()

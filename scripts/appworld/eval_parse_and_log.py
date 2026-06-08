@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_APPWORLD_EXE = "appworld-env/bin/appworld"
 
 
-@hydra.main(version_base=None, config_path="../phi_agents/rl/conf", config_name="appworld_eval")  # type: ignore[misc]
+@hydra.main(version_base=None, config_path="../../phi_agents/rl/conf", config_name="appworld_eval")  # type: ignore[misc]
 def main(cfg: MainInferenceConfig) -> None:
     # Run the bash command and capture the output
     df = extract_df(cfg)
