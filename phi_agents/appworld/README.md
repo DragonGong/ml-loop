@@ -33,6 +33,6 @@ Or using Conda
 
 ### Example scripts
 
-* `scripts/run_appworld_inference.py`: Run inference (using a simple GPT-4o React agent) on AppWorld for a given dataset split.
-* `scripts/visualize_appworld_queries.py`: Print the task queries for a given dataset split.
-* `scripts/write_appworld_task_ids.py`: (Requires appworld installed) Save the task IDs for a given dataset split into a txt file. This is useful since we need access to dataset task IDs without importing appworld directly.
+* `scripts/appworld/run_inference.py`: Run inference (using a simple GPT-4o React agent) on AppWorld for a given dataset split.
+* `scripts/appworld/visualize_queries.py`: Print the task queries for a given dataset split.
+* `scripts/appworld/write_task_ids.py`: (Requires appworld installed) Save the task IDs for a given dataset split into a txt file. This is useful since we need access to dataset task IDs without importing appworld directly.

@@ -33,7 +33,8 @@ def install_extra_datasets_command(extra_datasets: dict[str, str]) -> str:
     install_commands: list[str] = []
     for dataset_name, tasks_uri in extra_datasets.items():
         install_commands.append(
-            f"python scripts/appworld_phi_data.py --mode install --dataset-name {dataset_name} --tasks-uri {tasks_uri}"
+            "python scripts/appworld/phi_data.py "
+            f"--mode install --dataset-name {dataset_name} --tasks-uri {tasks_uri}"
         )
     return " && ".join(install_commands)
 

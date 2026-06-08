@@ -20,7 +20,7 @@ if [[ -z "$EXPERIMENT_NAME" ]]; then
   fi
 fi
 
-"$PYTHON_BIN" -m scripts.run_appworld_inference \
+"$PYTHON_BIN" -m scripts.appworld.run_inference \
   experiment_name="$EXPERIMENT_NAME" \
   llm=qwen_2_5_7b_eval \
   llm.adapter_path="$ADAPTER_PATH" \
@@ -32,8 +32,8 @@ fi
   llm.vllm_class.max_new_tokens=1200 \
   "${@:4}"
 
-"$PYTHON_BIN" -m scripts.appworld_eval_parse_and_log \
+"$PYTHON_BIN" -m scripts.appworld.eval_parse_and_log \
   experiment_name="$EXPERIMENT_NAME" \
   scenario_sampler.dataset_name="$SPLIT"
 
-"$PYTHON_BIN" -m scripts.summarize_appworld_episodes "$EXPERIMENT_NAME"
+"$PYTHON_BIN" -m scripts.loop7b.summarize_appworld_episodes "$EXPERIMENT_NAME"

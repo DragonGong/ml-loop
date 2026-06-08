@@ -81,7 +81,7 @@ In addition to that, you can use the following standalone script to evaluate any
 CUDA_VISIBLE_DEVICES=<...> \
 APPWORLD_ROOT=<...> \
 PATH=<path_to_repo>/appworld-env/bin:$PATH \
-python -m scripts.run_appworld_inference \
+python -m scripts.appworld.run_inference \
 experiment_name=appworld_eval_test_normal \
 llm=qwen_2_5_32b_eval \
 llm.adapter_path=<your-checkpoint> \
@@ -96,7 +96,7 @@ The following script analyzes the rollouts, calculates and logs success rate met
 ```bash
 APPWORLD_ROOT=<...> \
 PATH=<path_to_repo>/appworld-env/bin:$PATH \
-python -m scripts.appworld_eval_parse_and_log \
+python -m scripts.appworld.eval_parse_and_log \
 experiment_name=appworld_eval_test_normal \
 scenario_sampler.dataset_name=test_normal
 ```
