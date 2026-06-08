@@ -8,6 +8,7 @@ SPLIT="${1:-dev_small64}"
 ADAPTER_PATH="${2:-null}"
 EXPERIMENT_NAME="${3:-}"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+LLM_CONFIG="${LOOP7B_EVAL_LLM:-qwen_2_5_7b_eval}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PATH="$PWD/appworld-env/bin:$PATH"
@@ -23,7 +24,7 @@ fi
 
 "$PYTHON_BIN" -m scripts.appworld.run_inference \
   experiment_name="$EXPERIMENT_NAME" \
-  llm=qwen_2_5_7b_eval \
+  llm="$LLM_CONFIG" \
   llm.adapter_path="$ADAPTER_PATH" \
   scenario_sampler.dataset_name="$SPLIT" \
   num_scenario_runners=16 \
@@ -35,6 +36,7 @@ fi
 
 "$PYTHON_BIN" -m scripts.appworld.eval_parse_and_log \
   experiment_name="$EXPERIMENT_NAME" \
+  llm="$LLM_CONFIG" \
   scenario_sampler.dataset_name="$SPLIT"
 
 "$PYTHON_BIN" -m scripts.loop7b.summarize_appworld_episodes "$EXPERIMENT_NAME"

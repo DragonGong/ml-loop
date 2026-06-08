@@ -1,0 +1,4 @@
+defaults:
+- qwen_2_5_7b_lora16_eval
+
+temperature: 1.0
