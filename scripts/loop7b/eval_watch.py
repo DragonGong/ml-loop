@@ -203,16 +203,11 @@ def _run_and_log(command: list[str], env: dict[str, str], log_path: Path) -> Non
         print(printable)
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
+            stdout=log_fh,
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
-            bufsize=1,
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log_fh.write(line)
         return_code = process.wait()
         log_fh.write(
             f"# command_end {datetime.now().isoformat(timespec='seconds')} "
@@ -231,6 +226,11 @@ def _split_counts(repo_root: Path, appworld_root: Path, split: str) -> dict[str,
         if appworld_path.exists()
         else None,
     }
+
+
+def _episode_count(appworld_root: Path, experiment_name: str) -> int:
+    tasks_dir = appworld_root / "experiments" / "outputs" / experiment_name / "tasks"
+    return len(list(tasks_dir.glob("*/logs/episode.json"))) if tasks_dir.exists() else 0
 
 
 def _write_run_config(args: argparse.Namespace) -> None:
@@ -253,6 +253,7 @@ def _write_run_config(args: argparse.Namespace) -> None:
         "max_new_tokens": args.max_new_tokens,
         "eval_every": args.eval_every,
         "repeat": args.repeat,
+        "reuse_complete_inference": args.reuse_complete_inference,
     }
     paths["config"].write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
@@ -302,6 +303,11 @@ def _run_eval_once(
     env = _prepare_env(args, experiment_name)
 
     start_time = _now()
+    split_counts = _split_counts(args.repo_root, args.appworld_root, args.split)
+    expected_episodes = split_counts.get("appworld_split_count") or split_counts.get(
+        "repo_split_count"
+    )
+    existing_episodes = _episode_count(args.appworld_root, experiment_name)
     common_overrides = [
         f"experiment_name={experiment_name}",
         f"llm={args.llm}",
@@ -316,11 +322,23 @@ def _run_eval_once(
         *args.hydra_override,
     ]
 
-    _run_and_log(
-        [args.python_bin, "-m", "scripts.appworld.run_inference", *common_overrides],
-        env,
-        log_path,
-    )
+    if (
+        args.reuse_complete_inference
+        and expected_episodes is not None
+        and existing_episodes >= expected_episodes
+    ):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log_fh:
+            log_fh.write(
+                f"\n# reuse_complete_inference {datetime.now().isoformat(timespec='seconds')} "
+                f"existing_episodes={existing_episodes} expected_episodes={expected_episodes}\n"
+            )
+    else:
+        _run_and_log(
+            [args.python_bin, "-m", "scripts.appworld.run_inference", *common_overrides],
+            env,
+            log_path,
+        )
     _run_and_log(
         [
             args.python_bin,
@@ -388,7 +406,8 @@ def _run_eval_once(
             "eval_end_time": end_time,
             "episode_summary_path": str(episode_summary_path),
             "summary_dir": str(args.summary_dir),
-            **_split_counts(args.repo_root, args.appworld_root, args.split),
+            "episode_count": _episode_count(args.appworld_root, experiment_name),
+            **split_counts,
         }
     )
     rows = _load_rows(args.summary_dir)
@@ -526,6 +545,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=16384)
     parser.add_argument("--max-new-tokens", type=int, default=1200)
     parser.add_argument("--hydra-override", action="append", default=[])
+    parser.add_argument(
+        "--reuse-complete-inference", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--allow-test-split", action="store_true")
     return parser.parse_args()
 
