@@ -125,6 +125,22 @@ def suppress_train_envvars(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def get_cuda_architecture_for_devices(cuda_visible_devices: list[str] | None) -> int:
+    """Detect CUDA architecture using the same GPU visibility as the vLLM subprocess."""
+    if cuda_visible_devices is None:
+        return get_cuda_architecture()
+
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
+    try:
+        return get_cuda_architecture()
+    finally:
+        if original_cuda_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+
+
 class VLLMServer:
     _port: int
     _rpc_port: int
@@ -214,6 +230,11 @@ class VLLMServer:
         env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = str(True)
 
         executable = get_path_to_python_env_bin("vllm", override_path=self._conf.executable)
+        cuda_architecture = get_cuda_architecture_for_devices(self._cuda_visible_devices)
+        logger.info(
+            f"Detected CUDA architecture major={cuda_architecture} "
+            f"with {self._cuda_visible_devices=}"
+        )
 
         args = [
             str(executable),
@@ -225,7 +246,7 @@ class VLLMServer:
             "--return-tokens-as-token-ids",
         ]
 
-        if get_cuda_architecture() <= cuda_arc_to_major["volta"]:
+        if cuda_architecture <= cuda_arc_to_major["volta"]:
             args.append("--dtype=half")
         else:
             args.append(f"--dtype={self._conf.torch_dtype}")
@@ -243,7 +264,7 @@ class VLLMServer:
             args.append("--disable-log-stats")
 
         if self._conf.enable_prefix_caching:
-            if get_cuda_architecture() <= cuda_arc_to_major["volta"]:
+            if cuda_architecture <= cuda_arc_to_major["volta"]:
                 # https://github.com/vllm-project/vllm/issues/6723#issuecomment-2251907301
                 warnings.warn("Prefix caching not supported by Volta — leaving it off.")  # noqa: B028
             else:
