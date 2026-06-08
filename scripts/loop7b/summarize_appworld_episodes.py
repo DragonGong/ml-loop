@@ -1,3 +1,4 @@
+# 中文注释：统计 AppWorld episode 日志中的非官方错误类型和辅助指标。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

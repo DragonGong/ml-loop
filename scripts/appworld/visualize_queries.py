@@ -1,3 +1,4 @@
+# 中文注释：打印指定 AppWorld split 中的任务 query。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

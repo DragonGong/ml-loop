@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 中文注释：在 RTX PRO 6000 上运行 7B LOOP debug 训练。
 set -euo pipefail
 
 : "${APPWORLD_ROOT:?Set APPWORLD_ROOT before running.}"

@@ -1,3 +1,4 @@
+# 中文注释：检查 PyTorch 分布式和 NCCL 环境是否可用。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

@@ -1,3 +1,4 @@
+# 中文注释：在 AppWorld 任务 split 上运行 agent 推理并保存 episode。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

@@ -1,3 +1,4 @@
+# 中文注释：生成轻量 LOOP 实验使用的 AppWorld small split 文件。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

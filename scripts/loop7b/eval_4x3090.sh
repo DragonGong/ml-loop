@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 中文注释：在 4×3090 机器上并行评测 Qwen2.5-7B base 或 LoRA checkpoint。
 set -euo pipefail
 
 : "${APPWORLD_ROOT:?Set APPWORLD_ROOT before running.}"

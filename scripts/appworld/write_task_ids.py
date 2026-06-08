@@ -1,3 +1,4 @@
+# 中文注释：将指定 AppWorld split 的任务 ID 写入文本文件。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

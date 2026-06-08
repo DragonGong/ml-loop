@@ -1,3 +1,4 @@
+# 中文注释：把保存的 AppWorld episode 转为可视化页面。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

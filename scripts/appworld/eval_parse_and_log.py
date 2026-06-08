@@ -1,3 +1,4 @@
+# 中文注释：解析 AppWorld 官方评测输出并记录 TGC/SGC 汇总指标。
 #
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.

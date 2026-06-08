@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 中文注释：在远程机器上准备 ml-loop 7B 实验环境。
 set -euo pipefail
 
 CONDA_BIN="${CONDA_BIN:-$HOME/miniconda3/bin/conda}"
