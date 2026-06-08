@@ -125,8 +125,8 @@ class AppWorldInterface:
         """
         self._server: subprocess.Popen[bytes] | None = None
         self._docker: bool = False  # avoiding docker within docker
-        self._max_wait_tries: int = 5
-        self._wait_seconds: float = 1.0
+        self._max_wait_tries = max(1, int(os.environ.get("APPWORLD_SERVER_MAX_WAIT_TRIES", "30")))
+        self._wait_seconds = max(0.1, float(os.environ.get("APPWORLD_SERVER_WAIT_SECONDS", "1.0")))
         self._stdout_to_devnull = stdout_to_devnull
         self._init_server()
         self.timeout_seconds = timeout_seconds
