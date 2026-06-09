@@ -149,4 +149,7 @@ experiments/
 artifacts/
 
 /.codex_tmp
+
+# Local agent instructions and experiment reports
+/AGENTS.md
 doc/
