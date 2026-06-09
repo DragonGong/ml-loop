@@ -40,6 +40,10 @@ from phi_agents.rl.cloud_checkpointer import (
     get_last_checkpoint,
 )
 from phi_agents.rl.config import get_config
+from phi_agents.rl.iteration_manifest import (
+    IterationManifestStore,
+    manifest_abort_fields_from_exception,
+)
 from phi_agents.rl.parallel_scenario_sampler import ParallelScenarioSampler
 from phi_agents.rl.rl_utils import (
     Baseline,
@@ -300,6 +304,11 @@ class RLOOTrainer:
         self._cloud_checkpointer = CloudCheckpointer(
             self._cfg.cloud_path, self._local_path, local_rank, max_ckpts=self._cfg.max_ckpts
         )
+        iteration_manifest_cfg = self._cfg.get("iteration_manifest", {})
+        self._iteration_manifest_store = IterationManifestStore(
+            self._cfg.cloud_path,
+            enabled=bool(iteration_manifest_cfg.get("enabled", True)),
+        )
         self._speedometer = Speedometer(avg_period_seconds=900.0)  # 15 min
         assert (
             cfg.params.scenarios_per_iteration % world_size == 0
@@ -376,6 +385,7 @@ class RLOOTrainer:
         self._iterations_completed = 0
         self._global_step = 0
         self._rollouts_generated = self._output_tokens_generated = 0
+        self._active_iteration_manifest: tuple[int, int] | None = None
 
         self._with_wandb = self._rank == 0 and self._wandb_cfg.enable
         wandb_run_name: str | None = None
@@ -504,6 +514,86 @@ class RLOOTrainer:
             )
 
         profiler_load_state_dict(trainer_state["profiler_state"], logger)
+
+    def _expected_rollouts_per_iteration(self) -> int:
+        return int(
+            self._cfg.params.scenarios_per_iteration * self._cfg.params.rollouts_per_scenario
+        )
+
+    def _target_iteration(self) -> int:
+        return int(self._iterations_completed + 1)
+
+    def _begin_iteration_manifest(self, target_iteration: int, expected_rollouts: int) -> None:
+        if self._rank != 0:
+            return
+        manifest = self._iteration_manifest_store.begin(
+            iteration=target_iteration,
+            expected_rollouts=expected_rollouts,
+        )
+        logger.info(
+            "iteration manifest pending: "
+            f"iteration={manifest.iteration}, expected_rollouts={manifest.expected_rollouts}, "
+            f"finished_rollouts={manifest.finished_rollouts}, status={manifest.status}, "
+            f"attempt={manifest.attempt}"
+        )
+
+    def _commit_iteration_manifest(
+        self, target_iteration: int, expected_rollouts: int, finished_rollouts: int
+    ) -> None:
+        if self._rank == 0:
+            manifest = self._iteration_manifest_store.commit(
+                iteration=target_iteration,
+                expected_rollouts=expected_rollouts,
+                finished_rollouts=finished_rollouts,
+            )
+            logger.info(
+                "iteration manifest committed: "
+                f"iteration={manifest.iteration}, expected_rollouts={manifest.expected_rollouts}, "
+                f"finished_rollouts={manifest.finished_rollouts}, status={manifest.status}, "
+                f"attempt={manifest.attempt}"
+            )
+
+        self._accelerator.wait_for_everyone()
+        self._iteration_manifest_store.assert_committed(
+            iteration=target_iteration,
+            expected_rollouts=expected_rollouts,
+        )
+
+    def _global_finished_rollout_count(self, n_rollouts: int) -> int:
+        finished_rollouts: list[int | None] = [n_rollouts if self._rank == 0 else None]
+        if dist.is_initialized():
+            dist.broadcast_object_list(finished_rollouts, src=0)
+        assert finished_rollouts[0] is not None
+        return int(finished_rollouts[0])
+
+    def _abort_iteration_manifest(
+        self, target_iteration: int, expected_rollouts: int, exc: BaseException
+    ) -> None:
+        if self._rank != 0:
+            return
+        fields = manifest_abort_fields_from_exception(exc)
+        manifest = self._iteration_manifest_store.abort(
+            iteration=target_iteration,
+            expected_rollouts=expected_rollouts,
+            finished_rollouts=min(int(fields["finished_rollouts"]), expected_rollouts),
+            reason=str(fields["reason"]),
+            server_pid=fields["server_pid"],
+            server_port=fields["server_port"],
+            task_id=fields["task_id"],
+        )
+        logger.error(
+            "iteration manifest aborted: "
+            f"iteration={manifest.iteration}, expected_rollouts={manifest.expected_rollouts}, "
+            f"finished_rollouts={manifest.finished_rollouts}, status={manifest.status}, "
+            f"reason={manifest.reason}, server_pid={manifest.server_pid}, "
+            f"server_port={manifest.server_port}, task_id={manifest.task_id}"
+        )
+
+    def _abort_active_iteration_manifest(self, exc: BaseException) -> None:
+        if self._active_iteration_manifest is None:
+            return
+        target_iteration, expected_rollouts = self._active_iteration_manifest
+        self._abort_iteration_manifest(target_iteration, expected_rollouts, exc)
 
     def _compile_model(self, model: ModelType) -> None:
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
@@ -1576,6 +1666,10 @@ class RLOOTrainer:
         baseline_method = Baseline(self._cfg.params.baseline)
         for _ in range(self._iterations_completed, self._cfg.params.total_iterations):
             self._callbacks.before_iteration(self._iterations_completed, last_checkpoint_local_path)
+            target_iteration = self._target_iteration()
+            expected_rollouts = self._expected_rollouts_per_iteration()
+            self._begin_iteration_manifest(target_iteration, expected_rollouts)
+            self._active_iteration_manifest = (target_iteration, expected_rollouts)
 
             # use most recent adapter checkpoint (or base model if there is no adapter checkpoint) to do rollouts
             with profile("get_rollouts"), timeit(f"rank{self._rank}: get_rollouts", logger):
@@ -1614,6 +1708,18 @@ class RLOOTrainer:
 
             local_rollouts = list(itertools.chain(*rollouts))  # flatten the list of lists
             all_rollout_stats = self._reduce_stats(local_rollouts)
+            finished_rollouts = self._global_finished_rollout_count(all_rollout_stats.n_rollouts)
+            if finished_rollouts != expected_rollouts:
+                exc = RuntimeError(
+                    f"Incomplete rollout batch for iteration {target_iteration}: "
+                    f"{finished_rollouts=} {expected_rollouts=}"
+                )
+                setattr(exc, "finished_rollouts", finished_rollouts)
+                setattr(exc, "expected_rollouts", expected_rollouts)
+                raise exc
+            self._commit_iteration_manifest(
+                target_iteration, expected_rollouts, finished_rollouts
+            )
 
             # keep track of identifying information for each rollout
             local_rollout_ids = list(
@@ -1747,6 +1853,7 @@ class RLOOTrainer:
             )
             self._save_lora_checkpoint(last_checkpoint_local_path)
             self._cloud_checkpointer.on_save()
+            self._active_iteration_manifest = None
 
             if self._exclusive_inference_and_learning:
                 # inference and learning don't fit in memory together; free up CUDA memory:
@@ -1787,10 +1894,12 @@ class RLOOTrainer:
     def run(self) -> None:
         try:
             self._run()
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
+            self._abort_active_iteration_manifest(exc)
             logger.error("Interrupted!")
             raise
-        except Exception:
+        except Exception as exc:
+            self._abort_active_iteration_manifest(exc)
             # log the exception, labeled with the appropriate rank
             logger.exception("An error occurred in run()")
             raise

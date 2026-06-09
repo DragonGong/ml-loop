@@ -212,6 +212,10 @@ class AppWorldInterface:
         return self._server
 
     @property
+    def server_pid(self) -> int | None:
+        return None if self._server is None else self._server.pid
+
+    @property
     def remote_environment_url(self) -> str:
         return self._remote_environment_url
 
@@ -382,6 +386,19 @@ class AppWorldInterface:
         assert self.clean
         self._init_server()
         self._wait_for_server_ready()
+        self._task_id = None
+        self._last_closed_task_id = None
+
+    def force_close_server(self) -> None:
+        if self.clean:
+            return
+        try:
+            force_stop_appworld_environment_server(self.server)
+        except Exception:
+            logger.exception(
+                f"Force close for AppWorld server process {self.remote_environment_url} failed."
+            )
+        self._server = None
         self._task_id = None
         self._last_closed_task_id = None
 

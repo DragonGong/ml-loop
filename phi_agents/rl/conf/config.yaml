@@ -17,6 +17,9 @@ rl:
   cloud_path: experiments/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}/
   max_ckpts: 10 # Max checkpoints to keep during training
 
+  iteration_manifest:
+    enabled: True
+
   inference_requires_memory_gb: null
   learning_requires_memory_gb: null
 

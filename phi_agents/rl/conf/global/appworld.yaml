@@ -16,6 +16,11 @@ rl:
 
   scenario_runner:
     _target_: phi_agents.rl.appworld_scenario_runner.AppWorldScenarioRunner
+    server_health:
+      enabled: True
+      warning_rss_gb: 30.0
+      draining_rss_gb: 45.0
+      dead_rss_gb: 55.0
 
   eval:
     enable: True

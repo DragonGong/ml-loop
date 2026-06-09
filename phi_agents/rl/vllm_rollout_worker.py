@@ -446,6 +446,8 @@ class VLLMRolloutWorker:
                 msg = self._queue.get(block=True, timeout=1.0)
                 if isinstance(msg, Exception):
                     exception = msg
+                    setattr(exception, "finished_rollouts", n_rollouts_collected)
+                    setattr(exception, "expected_rollouts", n_rollouts_total)
                     logger.warning(f"rank{self._local_rank}: {exception=}")
                     # if we do not propagate an exception like this, the main thread will hang
                     # forever waiting for more items from the queue
