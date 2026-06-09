@@ -18,9 +18,13 @@ rl:
     _target_: phi_agents.rl.appworld_scenario_runner.AppWorldScenarioRunner
     server_health:
       enabled: True
-      warning_rss_gb: 30.0
-      draining_rss_gb: 45.0
-      dead_rss_gb: 55.0
+      recycle_rss_gb: 25.0
+      draining_rss_gb: 35.0
+      soft_dead_rss_gb: 45.0
+      hard_dead_rss_gb: 65.0
+      host_memory_hard_dead_percent: 85.0
+      max_rollout_retries: 2
+      max_soft_dead_per_iteration: 8
 
   eval:
     enable: True

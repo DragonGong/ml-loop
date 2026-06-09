@@ -1685,17 +1685,6 @@ class RLOOTrainer:
 
                 self._accelerator.wait_for_everyone()
 
-            if (
-                self._cfg.async_rollouts
-                and self._iterations_completed + 1 < self._cfg.params.total_iterations
-            ):
-                self._callbacks.before_new_rollouts()
-
-                # request rollout generation for the next iteration right away
-                self._rollout_worker.request_rollout_generation(
-                    scenarios_per_gpu_per_iteration, fu.lora_path(last_checkpoint_local_path)
-                )
-
             # load current model and broadcast to all workers
             if self._model is None or self._optimizer is None or self._lr_scheduler is None:
                 with profile("setup_model", burn=0), timeit("setup_model", self._rank0_logger):
@@ -1720,6 +1709,21 @@ class RLOOTrainer:
             self._commit_iteration_manifest(
                 target_iteration, expected_rollouts, finished_rollouts
             )
+            with profile("recycle_scenario_runners"), timeit(
+                "recycle_scenario_runners", logger
+            ):
+                self._rollout_worker.recycle_scenario_runners()
+
+            if (
+                self._cfg.async_rollouts
+                and self._iterations_completed + 1 < self._cfg.params.total_iterations
+            ):
+                self._callbacks.before_new_rollouts()
+
+                # request rollout generation for the next iteration right away
+                self._rollout_worker.request_rollout_generation(
+                    scenarios_per_gpu_per_iteration, fu.lora_path(last_checkpoint_local_path)
+                )
 
             # keep track of identifying information for each rollout
             local_rollout_ids = list(

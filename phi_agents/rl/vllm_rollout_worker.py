@@ -51,7 +51,7 @@ logger = get_phi_logger()
 ScenarioIdx = int
 ScenariosAndRollouts = tuple[list[Scenario], list[list[TrainingRollout]]]
 
-RolloutGenerationTask = tuple[ScenarioIdx, Scenario, int]
+RolloutGenerationTask = tuple[ScenarioIdx, Scenario, int, Any, int, int]
 
 
 class VLLMRolloutWorker:
@@ -78,6 +78,13 @@ class VLLMRolloutWorker:
         self._vllm_server_cfg = llm_cfg.vllm_server
         self._llm_cfg = llm_cfg
         self._runner_cfg = runner_cfg
+        server_health_cfg = runner_cfg.get("server_health") or {}
+        self._max_soft_dead_rollout_retries = int(
+            server_health_cfg.get("max_rollout_retries", 2)
+        )
+        self._max_soft_dead_per_iteration = int(
+            server_health_cfg.get("max_soft_dead_per_iteration", 8)
+        )
         self._local_rank = local_rank
         self._exclusive_inference_and_learning = exclusive_inference_and_learning
         self._max_gpu_mem_utilization: float | None = max_gpu_mem_utilization
@@ -278,26 +285,38 @@ class VLLMRolloutWorker:
                 )
             )
 
-        # mapping from rollout generation tasks to tuples (scenario_idx, scenario, runner_idx)
+        # mapping from rollout generation tasks to:
+        # (scenario_idx, scenario, rollout_idx, llm, retry_count, runner_idx)
         futures: dict[Future[TrainingRollout], RolloutGenerationTask] = {}
 
-        task_queue: Queue[tuple[ScenarioIdx, Scenario, TrainableLLM]] = Queue()
+        task_queue: Queue[tuple[ScenarioIdx, Scenario, int, TrainableLLM]] = Queue()
         n_tasks = 0
         scenarios = [next(self._scenario_sampler) for _ in range(n_scenarios)]
-        for _rollout_idx in range(self._rollouts_per_scenario):
+        for rollout_idx in range(self._rollouts_per_scenario):
             for sc_idx, scenario in enumerate(scenarios):
                 llm = llms[(n_tasks + self._local_rank) % len(llms)]
-                task_queue.put((sc_idx, scenario, llm))
+                task_queue.put((sc_idx, scenario, rollout_idx, llm))
                 n_tasks += 1
+        soft_dead_count = 0
 
         with ThreadPoolExecutor(max_workers=len(self._scenario_runners)) as executor:
+
+            def _submit_task(
+                runner_idx_: int,
+                sc_idx: ScenarioIdx,
+                scenario: Scenario,
+                rollout_idx: int,
+                llm: TrainableLLM,
+                retry_count: int,
+            ) -> None:
+                future = executor.submit(self._scenario_runners[runner_idx_].run, scenario, llm)
+                futures[future] = (sc_idx, scenario, rollout_idx, llm, retry_count, runner_idx_)
 
             def _maybe_submit_task(runner_idx_: int) -> bool:
                 try:
                     next_task = task_queue.get_nowait()
-                    sc_idx, scenario, llm = next_task
-                    future = executor.submit(self._scenario_runners[runner_idx_].run, scenario, llm)
-                    futures[future] = (sc_idx, scenario, runner_idx_)
+                    sc_idx, scenario, rollout_idx, llm = next_task
+                    _submit_task(runner_idx_, sc_idx, scenario, rollout_idx, llm, 0)
                     return True
                 except Empty:
                     return False
@@ -310,11 +329,51 @@ class VLLMRolloutWorker:
 
             while futures:
                 completed_future = next(as_completed(futures.keys()))
-                this_sc_idx, this_scenario, this_runner_idx = futures[completed_future]
-                rollout = completed_future.result()
+                (
+                    this_sc_idx,
+                    this_scenario,
+                    this_rollout_idx,
+                    this_llm,
+                    retry_count,
+                    this_runner_idx,
+                ) = futures.pop(completed_future)
+                try:
+                    rollout = completed_future.result()
+                except Exception as exc:
+                    if getattr(exc, "is_soft_dead", False):
+                        soft_dead_count += 1
+                        can_retry_rollout = retry_count < self._max_soft_dead_rollout_retries
+                        can_retry_iteration = (
+                            soft_dead_count <= self._max_soft_dead_per_iteration
+                        )
+                        if can_retry_rollout and can_retry_iteration:
+                            logger.warning(
+                                "Discarding soft-dead AppWorld rollout and retrying: "
+                                f"{this_sc_idx=} {this_rollout_idx=} "
+                                f"retry={retry_count + 1}/"
+                                f"{self._max_soft_dead_rollout_retries} "
+                                f"soft_dead_count={soft_dead_count}/"
+                                f"{self._max_soft_dead_per_iteration}"
+                            )
+                            _submit_task(
+                                this_runner_idx,
+                                this_sc_idx,
+                                this_scenario,
+                                this_rollout_idx,
+                                this_llm,
+                                retry_count + 1,
+                            )
+                            continue
+                        setattr(exc, "soft_dead_count", soft_dead_count)
+                        setattr(exc, "max_soft_dead_per_iteration", self._max_soft_dead_per_iteration)
+                        setattr(exc, "max_rollout_retries", self._max_soft_dead_rollout_retries)
+                        logger.error(
+                            "AppWorld soft-dead retry limit exceeded; aborting iteration. "
+                            f"{this_sc_idx=} {this_rollout_idx=} {retry_count=} "
+                            f"{soft_dead_count=}"
+                        )
+                    raise
                 yield this_scenario, this_sc_idx, rollout
-
-                futures.pop(completed_future)
 
                 # scenario runner `runner_idx` is now free, submit more tasks if we have any
                 _maybe_submit_task(this_runner_idx)
@@ -534,6 +593,16 @@ class VLLMRolloutWorker:
                         self._stop_servers()
 
         return cast(list[Scenario], scenarios), rollouts
+
+    def recycle_scenario_runners(self) -> None:
+        with ThreadPoolExecutor(max_workers=len(self._scenario_runners)) as executor:
+            futures = []
+            for runner in self._scenario_runners:
+                recycle_server = getattr(runner, "recycle_server", None)
+                if recycle_server is not None:
+                    futures.append(executor.submit(recycle_server))
+            for future in futures:
+                future.result()
 
     def _worker(self) -> None:
         while not self._stop_event.is_set():

@@ -389,6 +389,14 @@ class AppWorldInterface:
         self._task_id = None
         self._last_closed_task_id = None
 
+    def ensure_server(self) -> None:
+        if not self.clean:
+            return
+        self._init_server()
+        self._wait_for_server_ready()
+        self._task_id = None
+        self._last_closed_task_id = None
+
     def force_close_server(self) -> None:
         if self.clean:
             return

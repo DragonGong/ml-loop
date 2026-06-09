@@ -41,21 +41,38 @@ logger = get_phi_logger()
 @dataclass
 class AppWorldServerHealthConfig:
     enabled: bool = False
-    warning_rss_gb: float = 30.0
-    draining_rss_gb: float = 45.0
-    dead_rss_gb: float = 55.0
+    recycle_rss_gb: float = 25.0
+    draining_rss_gb: float = 35.0
+    soft_dead_rss_gb: float = 45.0
+    hard_dead_rss_gb: float = 65.0
+    host_memory_hard_dead_percent: float = 85.0
+    max_rollout_retries: int = 2
+    max_soft_dead_per_iteration: int = 8
     check_interval_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         if not (
             0
-            < self.warning_rss_gb
+            < self.recycle_rss_gb
             < self.draining_rss_gb
-            < self.dead_rss_gb
+            < self.soft_dead_rss_gb
+            < self.hard_dead_rss_gb
         ):
             raise ValueError(
-                "Expected 0 < warning_rss_gb < draining_rss_gb < dead_rss_gb, got "
-                f"{self.warning_rss_gb=}, {self.draining_rss_gb=}, {self.dead_rss_gb=}"
+                "Expected 0 < recycle_rss_gb < draining_rss_gb < "
+                "soft_dead_rss_gb < hard_dead_rss_gb, got "
+                f"{self.recycle_rss_gb=}, {self.draining_rss_gb=}, "
+                f"{self.soft_dead_rss_gb=}, {self.hard_dead_rss_gb=}"
+            )
+        if not (0 < self.host_memory_hard_dead_percent <= 100):
+            raise ValueError(
+                f"{self.host_memory_hard_dead_percent=} must be in (0, 100]"
+            )
+        if self.max_rollout_retries < 0:
+            raise ValueError(f"{self.max_rollout_retries=} must be non-negative")
+        if self.max_soft_dead_per_iteration < 0:
+            raise ValueError(
+                f"{self.max_soft_dead_per_iteration=} must be non-negative"
             )
         if self.check_interval_seconds <= 0:
             raise ValueError(f"{self.check_interval_seconds=} must be positive")
@@ -65,23 +82,48 @@ class AppWorldServerHealthConfig:
 class AppWorldServerHealthSnapshot:
     status: str
     rss_gb: float
+    host_memory_used_percent: float
     server_pid: int | None
     server_port: int
     task_id: str | None
 
 
-class AppWorldServerDeadError(RuntimeError):
-    def __init__(self, snapshot: AppWorldServerHealthSnapshot):
-        self.reason = "appworld_server_rss_55gb"
+class AppWorldServerHealthError(RuntimeError):
+    is_soft_dead = False
+    is_hard_dead = False
+
+    def __init__(self, snapshot: AppWorldServerHealthSnapshot, *, reason: str):
+        self.reason = reason
         self.server_pid = snapshot.server_pid
         self.server_port = snapshot.server_port
         self.task_id = snapshot.task_id
         self.rss_gb = snapshot.rss_gb
+        self.host_memory_used_percent = snapshot.host_memory_used_percent
         super().__init__(
             f"{self.reason}: rss_gb={snapshot.rss_gb:.2f}, "
+            f"host_memory_used_percent={snapshot.host_memory_used_percent:.1f}, "
             f"server_pid={snapshot.server_pid}, server_port={snapshot.server_port}, "
             f"task_id={snapshot.task_id}"
         )
+
+
+class AppWorldServerSoftDeadError(AppWorldServerHealthError):
+    is_soft_dead = True
+
+    def __init__(self, snapshot: AppWorldServerHealthSnapshot):
+        super().__init__(snapshot, reason="appworld_server_rss_45gb_soft_dead")
+
+
+class AppWorldServerDeadError(AppWorldServerHealthError):
+    is_hard_dead = True
+
+    def __init__(self, snapshot: AppWorldServerHealthSnapshot):
+        reason = (
+            "host_memory_used_85pct"
+            if snapshot.host_memory_used_percent >= 85.0
+            else "appworld_server_rss_65gb"
+        )
+        super().__init__(snapshot, reason=reason)
 
 
 def _process_tree_rss_gb(pid: int | None) -> float:
@@ -105,6 +147,10 @@ def _process_tree_rss_gb(pid: int | None) -> float:
         except psutil.Error:
             continue
     return rss / 1e9
+
+
+def _host_memory_used_percent() -> float:
+    return float(psutil.virtual_memory().percent)
 
 
 @dataclass
@@ -201,107 +247,150 @@ class AppWorldScenarioRunner(ScenarioRunner):
 
         self.world = AppWorldInterface(stdout_to_devnull=True)
         self.lock = threading.Lock()
-        self._draining_after_current_task = False
+        self._restart_after_current_task = False
 
     def _health_snapshot(self, task_id: str | None = None) -> AppWorldServerHealthSnapshot:
         rss_gb = _process_tree_rss_gb(self.world.server_pid)
-        if rss_gb >= self.server_health.dead_rss_gb:
-            status = "dead"
+        host_memory_used_percent = _host_memory_used_percent()
+        if host_memory_used_percent >= self.server_health.host_memory_hard_dead_percent:
+            status = "hard_dead"
+        elif rss_gb >= self.server_health.hard_dead_rss_gb:
+            status = "hard_dead"
+        elif rss_gb >= self.server_health.soft_dead_rss_gb:
+            status = "soft_dead"
         elif rss_gb >= self.server_health.draining_rss_gb:
             status = "draining"
+        elif rss_gb >= self.server_health.recycle_rss_gb:
+            status = "recycle_after_task"
         else:
             status = "healthy"
         return AppWorldServerHealthSnapshot(
             status=status,
             rss_gb=rss_gb,
+            host_memory_used_percent=host_memory_used_percent,
             server_pid=self.world.server_pid,
             server_port=self.world.port,
             task_id=task_id,
         )
 
-    def _raise_if_dead(self, snapshot: AppWorldServerHealthSnapshot) -> None:
-        if snapshot.status == "dead":
+    def _raise_if_hard_dead(self, snapshot: AppWorldServerHealthSnapshot) -> None:
+        if snapshot.status == "hard_dead":
             logger.error(
-                "AppWorld server is dead by RSS policy: "
+                "AppWorld server hit hard-dead health policy: "
+                f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, "
+                f"port={snapshot.server_port}, task_id={snapshot.task_id}, "
+                f"host_memory_used_percent={snapshot.host_memory_used_percent:.1f}"
+            )
+            raise AppWorldServerDeadError(snapshot)
+
+    def _raise_if_soft_dead(self, snapshot: AppWorldServerHealthSnapshot) -> None:
+        if snapshot.status == "soft_dead":
+            logger.error(
+                "AppWorld server hit soft-dead RSS policy: "
                 f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, "
                 f"port={snapshot.server_port}, task_id={snapshot.task_id}"
             )
-            raise AppWorldServerDeadError(snapshot)
+            self.world.force_close_server()
+            raise AppWorldServerSoftDeadError(snapshot)
+
+    def _restart_server(self, reason: str) -> None:
+        logger.warning(f"Restarting AppWorld server: {reason}")
+        if self.world.clean:
+            self.world.ensure_server()
+        else:
+            self.world.restart()
+        self._restart_after_current_task = False
 
     def _check_health_before_task(self, task_id: str) -> None:
         if not self.server_health.enabled:
             return
-        if self._draining_after_current_task:
-            logger.warning("Restarting draining AppWorld server before accepting a new task.")
-            self.world.restart()
-            self._draining_after_current_task = False
+        if self._restart_after_current_task:
+            self._restart_server("server was marked for recycle after previous task")
 
         snapshot = self._health_snapshot(task_id)
-        self._raise_if_dead(snapshot)
-        if snapshot.status == "draining":
-            logger.warning(
-                "AppWorld server already draining before task; restarting before new task. "
-                f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, port={snapshot.server_port}"
+        self._raise_if_hard_dead(snapshot)
+        if snapshot.status == "soft_dead":
+            self.world.force_close_server()
+            self._restart_server(
+                "server was soft-dead before accepting a new task; no rollout discarded"
             )
-            self.world.restart()
             return
-        if snapshot.rss_gb >= self.server_health.warning_rss_gb:
-            logger.warning(
-                "AppWorld server RSS warning before task: "
-                f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, port={snapshot.server_port}"
+        if snapshot.status in {"recycle_after_task", "draining"}:
+            self._restart_server(
+                "server was above recycle/draining threshold before accepting a new task"
             )
+            return
 
-    def _check_health_after_task(self, task_id: str) -> None:
-        if not self.server_health.enabled:
-            return
-        snapshot = self._health_snapshot(task_id)
-        self._raise_if_dead(snapshot)
+    def _mark_restart_after_task(self, snapshot: AppWorldServerHealthSnapshot) -> None:
         if snapshot.status == "draining":
             logger.warning(
                 "AppWorld server entering draining state after current task; "
                 f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, port={snapshot.server_port}"
             )
-            self._draining_after_current_task = True
-        elif snapshot.rss_gb >= self.server_health.warning_rss_gb:
+            self._restart_after_current_task = True
+        elif snapshot.status == "recycle_after_task":
             logger.warning(
-                "AppWorld server RSS warning after task: "
+                "AppWorld server will recycle after current task: "
                 f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, port={snapshot.server_port}"
             )
+            self._restart_after_current_task = True
+
+    def _check_health_after_task(self, task_id: str) -> None:
+        if not self.server_health.enabled:
+            return
+        snapshot = self._health_snapshot(task_id)
+        self._raise_if_hard_dead(snapshot)
+        self._raise_if_soft_dead(snapshot)
+        self._mark_restart_after_task(snapshot)
 
     def _start_dead_monitor(
         self, task_id: str, stop_event: threading.Event
-    ) -> tuple[threading.Thread | None, list[AppWorldServerHealthSnapshot]]:
-        dead_snapshots: list[AppWorldServerHealthSnapshot] = []
+    ) -> tuple[threading.Thread | None, list[AppWorldServerHealthSnapshot], list[AppWorldServerHealthSnapshot]]:
+        soft_dead_snapshots: list[AppWorldServerHealthSnapshot] = []
+        hard_dead_snapshots: list[AppWorldServerHealthSnapshot] = []
         if not self.server_health.enabled:
-            return None, dead_snapshots
+            return None, soft_dead_snapshots, hard_dead_snapshots
 
         def _monitor() -> None:
             while not stop_event.wait(self.server_health.check_interval_seconds):
                 snapshot = self._health_snapshot(task_id)
-                if snapshot.status == "dead":
-                    dead_snapshots.append(snapshot)
+                if snapshot.status == "hard_dead":
+                    hard_dead_snapshots.append(snapshot)
                     logger.error(
-                        "AppWorld server hit dead RSS threshold during task; force closing. "
+                        "AppWorld server hit hard-dead threshold during task; force closing. "
+                        f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, "
+                        f"port={snapshot.server_port}, task_id={task_id}, "
+                        f"host_memory_used_percent={snapshot.host_memory_used_percent:.1f}"
+                    )
+                    self.world.force_close_server()
+                    return
+                if snapshot.status == "soft_dead":
+                    soft_dead_snapshots.append(snapshot)
+                    logger.error(
+                        "AppWorld server hit soft-dead threshold during task; "
+                        "force closing and discarding rollout. "
                         f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, "
                         f"port={snapshot.server_port}, task_id={task_id}"
                     )
                     self.world.force_close_server()
                     return
-                if snapshot.rss_gb >= self.server_health.warning_rss_gb:
+                if snapshot.status in {"recycle_after_task", "draining"}:
                     logger.warning(
                         "AppWorld server RSS monitor warning: "
                         f"rss_gb={snapshot.rss_gb:.2f}, pid={snapshot.server_pid}, "
-                        f"port={snapshot.server_port}, task_id={task_id}"
+                        f"port={snapshot.server_port}, task_id={task_id}, "
+                        f"status={snapshot.status}"
                     )
 
         thread = threading.Thread(target=_monitor, daemon=True)
         thread.start()
-        return thread, dead_snapshots
+        return thread, soft_dead_snapshots, hard_dead_snapshots
 
     def run(self, scenario: Scenario, llm: TrainableLLM) -> TrainingRollout:
         assert isinstance(scenario, AppWorldScenario)
         task_id = scenario.task_id
 
+        self.world.ensure_server()
         assert self.world.server is not None
         self._check_health_before_task(task_id)
 
@@ -316,7 +405,9 @@ class AppWorldScenarioRunner(ScenarioRunner):
             logger.info(f"Generating episode; experiment_name={experiment_name}, task_id={task_id}")
             start = time.perf_counter()
             monitor_stop_event = threading.Event()
-            monitor_thread, dead_snapshots = self._start_dead_monitor(task_id, monitor_stop_event)
+            monitor_thread, soft_dead_snapshots, hard_dead_snapshots = (
+                self._start_dead_monitor(task_id, monitor_stop_event)
+            )
             try:
                 episode = run_vllm_inference_single_server_single_task(
                     world=self.world,
@@ -327,16 +418,20 @@ class AppWorldScenarioRunner(ScenarioRunner):
                     with_evaluation=True,
                 )
             except Exception as exc:
-                if dead_snapshots:
-                    raise AppWorldServerDeadError(dead_snapshots[-1]) from exc
+                if hard_dead_snapshots:
+                    raise AppWorldServerDeadError(hard_dead_snapshots[-1]) from exc
+                if soft_dead_snapshots:
+                    raise AppWorldServerSoftDeadError(soft_dead_snapshots[-1]) from exc
                 raise
             finally:
                 monitor_stop_event.set()
                 if monitor_thread is not None:
                     monitor_thread.join(timeout=1.0)
 
-        if dead_snapshots:
-            raise AppWorldServerDeadError(dead_snapshots[-1])
+        if hard_dead_snapshots:
+            raise AppWorldServerDeadError(hard_dead_snapshots[-1])
+        if soft_dead_snapshots:
+            raise AppWorldServerSoftDeadError(soft_dead_snapshots[-1])
 
         assert episode.eval_result is not None
         eval_result = episode.eval_result
@@ -379,3 +474,7 @@ class AppWorldScenarioRunner(ScenarioRunner):
     def cleanup(self) -> None:
         if not self.world.clean:
             self.world.close_server()
+
+    def recycle_server(self) -> None:
+        with self.lock:
+            self._restart_server("end of committed iteration")
