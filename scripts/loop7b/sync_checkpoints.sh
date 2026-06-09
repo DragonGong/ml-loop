@@ -11,6 +11,8 @@ EVAL_EVERY="${EVAL_EVERY:-10}"
 POLL_SECONDS="${POLL_SECONDS:-300}"
 ONCE="${ONCE:-0}"
 
+read -r -a DEST_SSH_ARGS <<< "$DEST_SSH_OPTS"
+
 is_complete_checkpoint() {
   local ckpt_dir="$1"
   [[ -f "$ckpt_dir/trainer_state.pt" ]] || return 1
@@ -24,15 +26,15 @@ sync_one_checkpoint() {
   local tmp_dir="${DEST_RUN_DIR}/.${ckpt_name}.tmp.$$"
   local final_dir="${DEST_RUN_DIR}/${ckpt_name}"
 
-  if ssh ${DEST_SSH_OPTS} "$DEST_HOST" "[ -f '$final_dir/.complete' ]"; then
+  if ssh "${DEST_SSH_ARGS[@]}" "$DEST_HOST" "[ -f '$final_dir/.complete' ]"; then
     echo "skip existing complete checkpoint: $ckpt_name"
     return 0
   fi
 
   echo "syncing $ckpt_name -> ${DEST_HOST}:${final_dir}"
-  ssh ${DEST_SSH_OPTS} "$DEST_HOST" "mkdir -p '$tmp_dir' '$(dirname "$final_dir")'"
+  ssh "${DEST_SSH_ARGS[@]}" "$DEST_HOST" "mkdir -p '$tmp_dir' '$(dirname "$final_dir")'"
   rsync -a -e "ssh ${DEST_SSH_OPTS}" "${ckpt_dir}/" "${DEST_HOST}:${tmp_dir}/"
-  ssh ${DEST_SSH_OPTS} "$DEST_HOST" "\
+  ssh "${DEST_SSH_ARGS[@]}" "$DEST_HOST" "\
     if [ -e '$final_dir' ] && [ ! -f '$final_dir/.complete' ]; then \
       echo 'destination exists without .complete: $final_dir' >&2; exit 2; \
     fi; \
