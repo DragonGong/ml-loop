@@ -63,8 +63,11 @@ def main(cfg: MainInferenceConfig) -> None:
         local_adapter_path = download_adapter(cfg.llm.adapter_path)
         downloaded_locally = local_adapter_path != cfg.llm.adapter_path
         cfg.llm.adapter_path = Path(local_adapter_path)
+    else:
+        downloaded_locally = False
 
     cancellation_event = threading.Event()
+    rollout_worker: VLLMRolloutWorker | None = None
 
     try:
         sampler = ParallelScenarioSampler(
@@ -114,6 +117,11 @@ def main(cfg: MainInferenceConfig) -> None:
         cancellation_event.set()
         raise
     finally:
+        if rollout_worker is not None:
+            try:
+                rollout_worker.stop(shutdown=False)
+            except Exception:
+                logger.exception("Failed to stop rollout worker cleanly.")
         if cfg.llm.adapter_path is not None and downloaded_locally:
             shutil.rmtree(cfg.llm.adapter_path)
             logger.debug(f"Deleted local adapter copy {cfg.llm.adapter_path}...")

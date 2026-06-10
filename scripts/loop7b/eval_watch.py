@@ -13,6 +13,7 @@ import csv
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -48,6 +49,9 @@ RETRYABLE_FAILURE_PATTERNS = (
     "less than desired gpu memory utilization",
     "out of memory",
     "cuda out of memory",
+    "connection refused",
+    "failed to establish a new connection",
+    "exceeded max retries on inference restarts",
 )
 
 
@@ -331,7 +335,47 @@ def _add_base_comparison(row: dict[str, Any], rows: list[dict[str, Any]]) -> Non
         row[f"increase_{metric}"] = _safe_div(row.get(metric), base.get(metric))
 
 
-def _run_and_log(command: list[str], env: dict[str, str], log_path: Path) -> None:
+def _terminate_process_group(pgid: int | None, log_fh: Any) -> None:
+    if pgid is None or os.name == "nt":
+        return
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        log_fh.write(f"# cleanup_process_group permission_denied pgid={pgid}: {exc}\n")
+        return
+
+    log_fh.write(f"# cleanup_process_group terminate pgid={pgid}\n")
+    log_fh.flush()
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.5)
+
+    log_fh.write(f"# cleanup_process_group kill pgid={pgid}\n")
+    log_fh.flush()
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def _run_and_log(
+    command: list[str],
+    env: dict[str, str],
+    log_path: Path,
+    *,
+    cleanup_process_group: bool = False,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     printable = " ".join(command)
     with log_path.open("a", encoding="utf-8") as log_fh:
@@ -339,18 +383,25 @@ def _run_and_log(command: list[str], env: dict[str, str], log_path: Path) -> Non
         log_fh.write(printable + "\n")
         log_fh.flush()
         print(printable)
+        start_new_session = cleanup_process_group and os.name != "nt"
         process = subprocess.Popen(
             command,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
+            start_new_session=start_new_session,
         )
-        return_code = process.wait()
-        log_fh.write(
-            f"# command_end {datetime.now().isoformat(timespec='seconds')} "
-            f"rc={return_code}\n"
-        )
+        pgid = os.getpgid(process.pid) if start_new_session else None
+        try:
+            return_code = process.wait()
+            log_fh.write(
+                f"# command_end {datetime.now().isoformat(timespec='seconds')} "
+                f"rc={return_code}\n"
+            )
+        finally:
+            if cleanup_process_group:
+                _terminate_process_group(pgid, log_fh)
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
 
@@ -479,6 +530,7 @@ def _run_eval_once(
             [args.python_bin, "-m", "scripts.appworld.run_inference", *common_overrides],
             env,
             log_path,
+            cleanup_process_group=True,
         )
     _run_and_log(
         [

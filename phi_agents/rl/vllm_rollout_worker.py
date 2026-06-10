@@ -628,7 +628,7 @@ class VLLMRolloutWorker:
 
         logger.info(f"RolloutWorker thread exits...")
 
-    def stop(self) -> None:
+    def stop(self, *, shutdown: bool = True) -> None:
         logger.info("Cancelling rollout generation...")
         self._cancellation_event.set()
 
@@ -643,4 +643,4 @@ class VLLMRolloutWorker:
             wait(futures)
 
         if self._servers is not None:
-            self._stop_servers(shutdown=True)
+            self._stop_servers(shutdown=shutdown)
