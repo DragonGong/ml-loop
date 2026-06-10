@@ -37,6 +37,16 @@ DOC_HIGHER_BETTER_METRICS = (
     "doc_before_api_call_rate",
 )
 PRIMARY_RATIO_METRICS = ("TGC", "SGC", "average_partial_pass_rate")
+RETRYABLE_FAILURE_PATTERNS = (
+    "no cuda available",
+    "cuda is not available",
+    "no cuda",
+    "free memory insufficient",
+    "insufficient free memory",
+    "not enough free memory",
+    "out of memory",
+    "cuda out of memory",
+)
 
 
 def _now() -> str:
@@ -62,6 +72,67 @@ def _safe_div(numerator: Any, denominator: Any) -> float | None:
     if num is None or den is None or den == 0:
         return None
     return num / den
+
+
+def _cuda_device_indices(cuda_visible_devices: str) -> list[int]:
+    indices: list[int] = []
+    for item in cuda_visible_devices.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.isdigit():
+            indices.append(int(item))
+    return indices
+
+
+def _gpu_status() -> dict[int, dict[str, int]]:
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,memory.used,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    output = subprocess.check_output(command, text=True)
+    statuses: dict[int, dict[str, int]] = {}
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        index, memory_used_mib, utilization_gpu = (int(part) for part in parts)
+        statuses[index] = {
+            "memory_used_mib": memory_used_mib,
+            "utilization_gpu": utilization_gpu,
+        }
+    return statuses
+
+
+def _target_gpus_idle(args: argparse.Namespace) -> tuple[bool, str]:
+    target_indices = _cuda_device_indices(args.cuda_visible_devices)
+    if not target_indices:
+        return True, "no numeric CUDA_VISIBLE_DEVICES targets"
+    try:
+        statuses = _gpu_status()
+    except Exception as exc:
+        return False, f"nvidia-smi failed: {exc}"
+
+    busy_details = []
+    for index in target_indices:
+        status = statuses.get(index)
+        if status is None:
+            busy_details.append(f"gpu{index}=missing")
+            continue
+        memory_used = status["memory_used_mib"]
+        utilization = status["utilization_gpu"]
+        if (
+            memory_used > args.gpu_idle_max_memory_mib
+            or utilization > args.gpu_idle_max_utilization
+        ):
+            busy_details.append(
+                f"gpu{index}=mem{memory_used}MiB/util{utilization}%"
+            )
+
+    if busy_details:
+        return False, "; ".join(busy_details)
+    return True, "idle"
 
 
 def _checkpoint_iteration(path: Path) -> int | None:
@@ -90,6 +161,7 @@ def _summary_paths(summary_dir: Path) -> dict[str, Path]:
         "history": summary_dir / "summary_history.jsonl",
         "best": summary_dir / "best_checkpoint.json",
         "config": summary_dir / "RUN_CONFIG.json",
+        "failures": summary_dir / "eval_failures.jsonl",
     }
 
 
@@ -120,6 +192,67 @@ def _append_history(summary_dir: Path, row: dict[str, Any]) -> None:
     path = _summary_paths(summary_dir)["history"]
     with path.open("a") as fh:
         fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _log_path_for_eval(
+    args: argparse.Namespace,
+    *,
+    checkpoint_name: str,
+    checkpoint_iteration: int | None,
+    repeat_index: int,
+) -> Path:
+    experiment_name = _experiment_name(
+        args=args,
+        checkpoint_name=checkpoint_name,
+        iteration=checkpoint_iteration,
+        repeat_index=repeat_index,
+    )
+    return args.summary_dir / "logs" / f"{experiment_name}.log"
+
+
+def _tail_text(path: Path, max_chars: int = 20000) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(errors="ignore")
+    return text[-max_chars:]
+
+
+def _classify_failure(log_path: Path, exc: BaseException) -> tuple[bool, str]:
+    text = _tail_text(log_path)
+    lower_text = text.lower()
+    for pattern in RETRYABLE_FAILURE_PATTERNS:
+        if pattern in lower_text:
+            return True, pattern
+    return False, f"{type(exc).__name__}: {exc}"
+
+
+def _record_eval_failure(
+    args: argparse.Namespace,
+    *,
+    checkpoint_name: str,
+    checkpoint_iteration: int | None,
+    repeat_index: int,
+    log_path: Path,
+    reason: str,
+    retryable: bool,
+    return_code: int | None,
+) -> None:
+    path = _summary_paths(args.summary_dir)["failures"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "time": _now(),
+        "split": args.split,
+        "checkpoint_name": checkpoint_name,
+        "checkpoint_iteration": checkpoint_iteration,
+        "repeat_index": repeat_index,
+        "log_path": str(log_path),
+        "reason": reason,
+        "retryable": retryable,
+        "return_code": return_code,
+        "cuda_visible_devices": args.cuda_visible_devices,
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def _row_key(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -252,6 +385,9 @@ def _write_run_config(args: argparse.Namespace) -> None:
         "max_model_len": args.max_model_len,
         "max_new_tokens": args.max_new_tokens,
         "eval_every": args.eval_every,
+        "wait_for_gpu_idle": args.wait_for_gpu_idle,
+        "gpu_idle_max_memory_mib": args.gpu_idle_max_memory_mib,
+        "gpu_idle_max_utilization": args.gpu_idle_max_utilization,
         "repeat": args.repeat,
         "reuse_complete_inference": args.reuse_complete_inference,
     }
@@ -470,22 +606,102 @@ def _checkpoint_paths(args: argparse.Namespace) -> list[Path]:
 
 
 def _watch(args: argparse.Namespace) -> None:
-    if args.run_base_if_missing:
-        _run_base_if_needed(args)
-
     while True:
+        if args.wait_for_gpu_idle:
+            idle, gpu_reason = _target_gpus_idle(args)
+            if not idle:
+                print(
+                    f"target GPUs busy; wait {args.poll_seconds}s before retry: {gpu_reason}",
+                    flush=True,
+                )
+                if args.once:
+                    break
+                time.sleep(args.poll_seconds)
+                continue
+
+        if args.run_base_if_missing:
+            rows = _load_rows(args.summary_dir)
+            if not _already_evaluated(rows, args.split, "base"):
+                try:
+                    _run_base_if_needed(args)
+                except subprocess.CalledProcessError as exc:
+                    log_path = _log_path_for_eval(
+                        args,
+                        checkpoint_name="base",
+                        checkpoint_iteration=None,
+                        repeat_index=0,
+                    )
+                    retryable, reason = _classify_failure(log_path, exc)
+                    _record_eval_failure(
+                        args,
+                        checkpoint_name="base",
+                        checkpoint_iteration=None,
+                        repeat_index=0,
+                        log_path=log_path,
+                        reason=reason,
+                        retryable=retryable,
+                        return_code=exc.returncode,
+                    )
+                    if not retryable:
+                        raise
+                    print(
+                        f"base eval failed with retryable reason={reason}; "
+                        f"will retry after GPUs are idle",
+                        flush=True,
+                    )
+                    if args.once:
+                        break
+                    time.sleep(args.poll_seconds)
+                    continue
+
         rows = _load_rows(args.summary_dir)
         for checkpoint_path in _checkpoint_paths(args):
             checkpoint_name = checkpoint_path.name
             if _already_evaluated(rows, args.split, checkpoint_name):
                 continue
             iteration = _checkpoint_iteration(checkpoint_path)
-            _run_repeats(
-                args,
-                adapter_path=str(checkpoint_path),
-                checkpoint_name=checkpoint_name,
-                checkpoint_iteration=iteration,
-            )
+            if args.wait_for_gpu_idle:
+                idle, gpu_reason = _target_gpus_idle(args)
+                if not idle:
+                    print(
+                        f"target GPUs became busy before {checkpoint_name}; "
+                        f"wait {args.poll_seconds}s: {gpu_reason}",
+                        flush=True,
+                    )
+                    break
+            try:
+                _run_repeats(
+                    args,
+                    adapter_path=str(checkpoint_path),
+                    checkpoint_name=checkpoint_name,
+                    checkpoint_iteration=iteration,
+                )
+            except subprocess.CalledProcessError as exc:
+                log_path = _log_path_for_eval(
+                    args,
+                    checkpoint_name=checkpoint_name,
+                    checkpoint_iteration=iteration,
+                    repeat_index=0,
+                )
+                retryable, reason = _classify_failure(log_path, exc)
+                _record_eval_failure(
+                    args,
+                    checkpoint_name=checkpoint_name,
+                    checkpoint_iteration=iteration,
+                    repeat_index=0,
+                    log_path=log_path,
+                    reason=reason,
+                    retryable=retryable,
+                    return_code=exc.returncode,
+                )
+                if not retryable:
+                    raise
+                print(
+                    f"{checkpoint_name} eval failed with retryable reason={reason}; "
+                    "will retry after GPUs are idle",
+                    flush=True,
+                )
+                break
             rows = _load_rows(args.summary_dir)
 
         if args.once:
@@ -527,6 +743,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="dev_small64")
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--poll-seconds", type=int, default=300)
+    parser.add_argument(
+        "--wait-for-gpu-idle", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--gpu-idle-max-memory-mib", type=int, default=1024)
+    parser.add_argument("--gpu-idle-max-utilization", type=int, default=5)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
         "--run-base-if-missing", action=argparse.BooleanOptionalAction, default=True
