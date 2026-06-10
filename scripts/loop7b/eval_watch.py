@@ -42,8 +42,10 @@ RETRYABLE_FAILURE_PATTERNS = (
     "cuda is not available",
     "no cuda",
     "free memory insufficient",
+    "free memory on device",
     "insufficient free memory",
     "not enough free memory",
+    "less than desired gpu memory utilization",
     "out of memory",
     "cuda out of memory",
 )
@@ -219,6 +221,9 @@ def _tail_text(path: Path, max_chars: int = 20000) -> str:
 
 def _classify_failure(log_path: Path, exc: BaseException) -> tuple[bool, str]:
     text = _tail_text(log_path)
+    last_command_start = text.rfind("# command_start")
+    if last_command_start >= 0:
+        text = text[last_command_start:]
     lower_text = text.lower()
     for pattern in RETRYABLE_FAILURE_PATTERNS:
         if pattern in lower_text:
