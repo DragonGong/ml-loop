@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
+import math
 import os
 import re
 import signal
@@ -112,14 +114,25 @@ def _gpu_status() -> dict[int, dict[str, int]]:
 
 
 def _target_gpus_idle(args: argparse.Namespace) -> tuple[bool, str]:
+    idle_indices, reason = _idle_cuda_device_indices(args)
     target_indices = _cuda_device_indices(args.cuda_visible_devices)
     if not target_indices:
-        return True, "no numeric CUDA_VISIBLE_DEVICES targets"
+        return True, reason
+    if len(idle_indices) == len(target_indices):
+        return True, "idle"
+    return False, reason
+
+
+def _idle_cuda_device_indices(args: argparse.Namespace) -> tuple[list[int], str]:
+    target_indices = _cuda_device_indices(args.cuda_visible_devices)
+    if not target_indices:
+        return [], "no numeric CUDA_VISIBLE_DEVICES targets"
     try:
         statuses = _gpu_status()
     except Exception as exc:
-        return False, f"nvidia-smi failed: {exc}"
+        return [], f"nvidia-smi failed: {exc}"
 
+    idle_indices = []
     busy_details = []
     for index in target_indices:
         status = statuses.get(index)
@@ -135,10 +148,40 @@ def _target_gpus_idle(args: argparse.Namespace) -> tuple[bool, str]:
             busy_details.append(
                 f"gpu{index}=mem{memory_used}MiB/util{utilization}%"
             )
+        else:
+            idle_indices.append(index)
 
+    idle_text = (
+        "idle=" + ",".join(f"gpu{index}" for index in idle_indices)
+        if idle_indices
+        else "idle=none"
+    )
     if busy_details:
-        return False, "; ".join(busy_details)
-    return True, "idle"
+        return idle_indices, f"{idle_text}; busy=" + "; ".join(busy_details)
+    return idle_indices, idle_text
+
+
+def _eval_args_for_cuda_devices(
+    args: argparse.Namespace, cuda_device_indices: list[int]
+) -> argparse.Namespace:
+    eval_args = copy.copy(args)
+    eval_args.cuda_visible_devices = ",".join(str(index) for index in cuda_device_indices)
+
+    target_count = max(1, len(_cuda_device_indices(args.cuda_visible_devices)))
+    runners_per_gpu = max(1, math.ceil(args.num_scenario_runners / target_count))
+    eval_args.num_scenario_runners = max(1, runners_per_gpu * len(cuda_device_indices))
+    return eval_args
+
+
+def _select_eval_args_for_available_gpus(
+    args: argparse.Namespace,
+) -> tuple[argparse.Namespace | None, str]:
+    if not args.wait_for_gpu_idle:
+        return args, "using configured CUDA_VISIBLE_DEVICES"
+    idle_indices, reason = _idle_cuda_device_indices(args)
+    if not idle_indices:
+        return None, reason
+    return _eval_args_for_cuda_devices(args, idle_indices), reason
 
 
 def _checkpoint_iteration(path: Path) -> int | None:
@@ -664,33 +707,40 @@ def _checkpoint_paths(args: argparse.Namespace) -> list[Path]:
 
 def _watch(args: argparse.Namespace) -> None:
     while True:
-        if args.wait_for_gpu_idle:
-            idle, gpu_reason = _target_gpus_idle(args)
-            if not idle:
+        eval_args, gpu_reason = _select_eval_args_for_available_gpus(args)
+        if eval_args is None:
+            if args.wait_for_gpu_idle:
                 print(
-                    f"target GPUs busy; wait {args.poll_seconds}s before retry: {gpu_reason}",
+                    f"no target GPUs idle; wait {args.poll_seconds}s before retry: {gpu_reason}",
                     flush=True,
                 )
-                if args.once:
-                    break
-                time.sleep(args.poll_seconds)
-                continue
+            if args.once:
+                break
+            time.sleep(args.poll_seconds)
+            continue
+        if args.wait_for_gpu_idle:
+            print(
+                "using available target GPUs: "
+                f"CUDA_VISIBLE_DEVICES={eval_args.cuda_visible_devices}, "
+                f"num_scenario_runners={eval_args.num_scenario_runners}; {gpu_reason}",
+                flush=True,
+            )
 
         if args.run_base_if_missing:
             rows = _load_rows(args.summary_dir)
             if not _already_evaluated(rows, args.split, "base"):
                 try:
-                    _run_base_if_needed(args)
+                    _run_base_if_needed(eval_args)
                 except subprocess.CalledProcessError as exc:
                     log_path = _log_path_for_eval(
-                        args,
+                        eval_args,
                         checkpoint_name="base",
                         checkpoint_iteration=None,
                         repeat_index=0,
                     )
                     retryable, reason = _classify_failure(log_path, exc)
                     _record_eval_failure(
-                        args,
+                        eval_args,
                         checkpoint_name="base",
                         checkpoint_iteration=None,
                         repeat_index=0,
@@ -703,7 +753,7 @@ def _watch(args: argparse.Namespace) -> None:
                         raise
                     print(
                         f"base eval failed with retryable reason={reason}; "
-                        f"will retry after GPUs are idle",
+                        f"will retry after GPUs are available",
                         flush=True,
                     )
                     if args.once:
@@ -717,32 +767,38 @@ def _watch(args: argparse.Namespace) -> None:
             if _already_evaluated(rows, args.split, checkpoint_name):
                 continue
             iteration = _checkpoint_iteration(checkpoint_path)
+            eval_args, gpu_reason = _select_eval_args_for_available_gpus(args)
+            if eval_args is None:
+                print(
+                    f"no target GPUs idle before {checkpoint_name}; "
+                    f"wait {args.poll_seconds}s: {gpu_reason}",
+                    flush=True,
+                )
+                break
             if args.wait_for_gpu_idle:
-                idle, gpu_reason = _target_gpus_idle(args)
-                if not idle:
-                    print(
-                        f"target GPUs became busy before {checkpoint_name}; "
-                        f"wait {args.poll_seconds}s: {gpu_reason}",
-                        flush=True,
-                    )
-                    break
+                print(
+                    f"running {checkpoint_name} on available target GPUs: "
+                    f"CUDA_VISIBLE_DEVICES={eval_args.cuda_visible_devices}, "
+                    f"num_scenario_runners={eval_args.num_scenario_runners}; {gpu_reason}",
+                    flush=True,
+                )
             try:
                 _run_repeats(
-                    args,
+                    eval_args,
                     adapter_path=str(checkpoint_path),
                     checkpoint_name=checkpoint_name,
                     checkpoint_iteration=iteration,
                 )
             except subprocess.CalledProcessError as exc:
                 log_path = _log_path_for_eval(
-                    args,
+                    eval_args,
                     checkpoint_name=checkpoint_name,
                     checkpoint_iteration=iteration,
                     repeat_index=0,
                 )
                 retryable, reason = _classify_failure(log_path, exc)
                 _record_eval_failure(
-                    args,
+                    eval_args,
                     checkpoint_name=checkpoint_name,
                     checkpoint_iteration=iteration,
                     repeat_index=0,
@@ -755,7 +811,7 @@ def _watch(args: argparse.Namespace) -> None:
                     raise
                 print(
                     f"{checkpoint_name} eval failed with retryable reason={reason}; "
-                    "will retry after GPUs are idle",
+                    "will retry after GPUs are available",
                     flush=True,
                 )
                 break
