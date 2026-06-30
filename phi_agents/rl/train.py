@@ -49,6 +49,8 @@ from phi_agents.rl.rl_utils import (
     Baseline,
     GradientRMS,
     LossType,
+    RLAlgorithm,
+    compute_advantage_estimates,
     inference_and_learning_share_gpus,
     is_policy_gradient_loss,
     wandb_init,
@@ -318,6 +320,8 @@ class RLOOTrainer:
         if self._cfg.recompute_rollout_probs and self._cfg.async_rollouts:
             raise ValueError("recompute_rollout_probs is incompatible with async_rollouts.")
 
+        self._validate_algorithm_config()
+
         # Logging
         if self._rank == 0:
             logger.info(
@@ -428,6 +432,25 @@ class RLOOTrainer:
         self._invalid_steps_skipped: int = 0
         self._high_kl_events: int = 0
         self._n_outlier_grads: int = 0
+
+    def _validate_algorithm_config(self) -> None:
+        algorithm = RLAlgorithm(self._cfg.params.get("algorithm", RLAlgorithm.LOOP))
+
+        if self._cfg.params.rollouts_per_scenario < 2:
+            raise ValueError(
+                "At least two rollouts per scenario are required for grouped advantage estimates."
+            )
+
+        if algorithm == RLAlgorithm.GRPO:
+            loss_type = LossType(self._cfg.params.loss_type)
+            if loss_type != LossType.PG_PER_TOKEN:
+                raise ValueError(f"GRPO requires loss_type={LossType.PG_PER_TOKEN}.")
+            if not self._cfg.params.do_ppo_clipping:
+                raise ValueError("GRPO requires do_ppo_clipping=True.")
+            if not math.isclose(float(self._cfg.params.ppo_epsilon), 0.1):
+                raise ValueError("GRPO requires ppo_epsilon=0.1.")
+            if not math.isclose(float(self._cfg.params.rloo_kl_lambda), 0.0):
+                raise ValueError("GRPO does not use rloo_kl_lambda; set it to 0.0.")
 
     def _get_tokenizer(self) -> PreTrainedTokenizer:
         from transformers.models.auto.tokenization_auto import AutoTokenizer
@@ -701,39 +724,14 @@ class RLOOTrainer:
         self._accelerator.wait_for_everyone()
         return model, optimizer, lr_scheduler
 
-    def _compute_adv_estimates(
-        self, rollouts: list[list[TrainingRollout]], baseline: Baseline, adv_normalization: bool
-    ) -> np.ndarray:
-        """Accumulate the gradient estimate contribution from these rollouts from the same scenario.
-        Also return the log importance weights.
-        """
-        adv_estimates = []
-
-        for scenario_rollouts in rollouts:
-            assert len(scenario_rollouts) >= 2
-            total_return_for_scenario = sum(rollout.ret for rollout in scenario_rollouts)
-            rets = np.array([rollout.ret for rollout in scenario_rollouts])
-
-            # baseline for a rollout is the average return of all other rollouts
-            match baseline:
-                case Baseline.LOO:
-                    baselines = np.array(
-                        [(total_return_for_scenario - ret) / (len(rets) - 1) for ret in rets]
-                    )
-                case Baseline.LNO:
-                    baselines = np.mean(rets)
-                case _:
-                    raise ValueError(f"Unsupported {baseline=}")
-            adv = rets - baselines
-
-            if adv_normalization:
-                ret_std = np.std(rets)
-                adv /= np.clip(ret_std, a_min=1e-7, a_max=None)
-
-            adv_estimates.append(adv)
-
-        adv_estimates = np.concatenate(adv_estimates)
-        return adv_estimates
+    def _compute_adv_estimates(self, rollouts: list[list[TrainingRollout]]) -> np.ndarray:
+        """Compute rollout advantages according to the configured RL algorithm."""
+        return compute_advantage_estimates(
+            rollouts,
+            algorithm=RLAlgorithm(self._cfg.params.get("algorithm", RLAlgorithm.LOOP)),
+            baseline=Baseline(self._cfg.params.baseline),
+            adv_normalization=bool(self._cfg.params.adv_normalization),
+        )
 
     def _filter_rollouts(
         self, rollouts: list[TrainingRollout], adv_estimates: np.ndarray, ids: list[RolloutID]
@@ -1663,7 +1661,6 @@ class RLOOTrainer:
             f"Running for {self._cfg.params.total_iterations=}, {self._cfg.async_rollouts=}"
         )
 
-        baseline_method = Baseline(self._cfg.params.baseline)
         for _ in range(self._iterations_completed, self._cfg.params.total_iterations):
             self._callbacks.before_iteration(self._iterations_completed, last_checkpoint_local_path)
             target_iteration = self._target_iteration()
@@ -1703,8 +1700,8 @@ class RLOOTrainer:
                     f"Incomplete rollout batch for iteration {target_iteration}: "
                     f"{finished_rollouts=} {expected_rollouts=}"
                 )
-                setattr(exc, "finished_rollouts", finished_rollouts)
-                setattr(exc, "expected_rollouts", expected_rollouts)
+                exc.finished_rollouts = finished_rollouts  # type: ignore[attr-defined]
+                exc.expected_rollouts = expected_rollouts  # type: ignore[attr-defined]
                 raise exc
             self._commit_iteration_manifest(
                 target_iteration, expected_rollouts, finished_rollouts
@@ -1735,11 +1732,7 @@ class RLOOTrainer:
                 set_profiling_num_elements(all_rollout_stats.n_output_tokens),
                 profile("adv_filtering"),
             ):
-                local_adv = self._compute_adv_estimates(
-                    rollouts,
-                    baseline=baseline_method,
-                    adv_normalization=self._cfg.params.adv_normalization,
-                )
+                local_adv = self._compute_adv_estimates(rollouts)
 
                 local_rollout_data: RolloutsAdvantagesIDs = (
                     local_rollouts,

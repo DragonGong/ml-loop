@@ -3,6 +3,7 @@ epochs_per_iteration: 2
 scenarios_per_iteration: 40
 rollouts_per_scenario: 6
 minibatch_size: 32 # divided across GPUs. must be a multiple of world_size
+algorithm: loop # loop, grpo
 loss_type: pg_per_token # pg_per_trajectory, pg_per_token
 do_ppo_clipping: True # only for policy gradient losses
 ppo_epsilon: 0.1

@@ -4,10 +4,13 @@
 #
 
 import os
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
+import numpy as np
 import wandb
 import wandb.util
 from omegaconf import DictConfig, OmegaConf
@@ -29,8 +32,92 @@ class Baseline(StrEnum):
     LOO = "leave_one_out"
 
 
+class RLAlgorithm(StrEnum):
+    LOOP = "loop"
+    GRPO = "grpo"
+
+
+class RolloutWithReturn(Protocol):
+    ret: float
+
+
 def is_policy_gradient_loss(loss_type: LossType) -> bool:
     return loss_type in (LossType.PG_PER_TRAJECTORY, LossType.PG_PER_TOKEN)
+
+
+def _returns_for_scenario(scenario_rollouts: Sequence[RolloutWithReturn]) -> np.ndarray:
+    if len(scenario_rollouts) < 2:
+        raise ValueError(
+            "At least two rollouts per scenario are required for grouped advantage estimates."
+        )
+    return np.array([rollout.ret for rollout in scenario_rollouts], dtype=float)
+
+
+def compute_loop_advantages(
+    rollouts: Sequence[Sequence[RolloutWithReturn]],
+    baseline: Baseline | str,
+    adv_normalization: bool,
+) -> np.ndarray:
+    """Compute the original LOOP/RLOO Monte Carlo advantage estimates."""
+    baseline = Baseline(baseline)
+    adv_estimates = []
+
+    for scenario_rollouts in rollouts:
+        rets = _returns_for_scenario(scenario_rollouts)
+        total_return_for_scenario = float(np.sum(rets))
+
+        match baseline:
+            case Baseline.LOO:
+                baselines = np.array(
+                    [(total_return_for_scenario - ret) / (len(rets) - 1) for ret in rets],
+                    dtype=float,
+                )
+            case Baseline.LNO:
+                baselines = np.full_like(rets, float(np.mean(rets)), dtype=float)
+            case _:
+                raise ValueError(f"Unsupported {baseline=}")
+        adv = rets - baselines
+
+        if adv_normalization:
+            ret_std = float(np.std(rets))
+            adv /= np.clip(ret_std, a_min=1e-7, a_max=None)
+
+        adv_estimates.append(adv)
+
+    return np.concatenate(adv_estimates) if adv_estimates else np.array([], dtype=float)
+
+
+def compute_grpo_advantages(
+    rollouts: Sequence[Sequence[RolloutWithReturn]],
+) -> np.ndarray:
+    """Compute GRPO group-normalized advantages per scenario."""
+    adv_estimates = []
+
+    for scenario_rollouts in rollouts:
+        rets = _returns_for_scenario(scenario_rollouts)
+        group_mean = float(np.mean(rets))
+        group_std = float(np.std(rets))
+        adv = (rets - group_mean) / np.clip(group_std, a_min=1e-7, a_max=None)
+        adv_estimates.append(adv)
+
+    return np.concatenate(adv_estimates) if adv_estimates else np.array([], dtype=float)
+
+
+def compute_advantage_estimates(
+    rollouts: Sequence[Sequence[RolloutWithReturn]],
+    *,
+    algorithm: RLAlgorithm | str,
+    baseline: Baseline | str,
+    adv_normalization: bool,
+) -> np.ndarray:
+    """Dispatch grouped rollout returns to the configured RL algorithm."""
+    match RLAlgorithm(algorithm):
+        case RLAlgorithm.LOOP:
+            return compute_loop_advantages(rollouts, baseline, adv_normalization)
+        case RLAlgorithm.GRPO:
+            return compute_grpo_advantages(rollouts)
+        case _:
+            raise ValueError(f"Unsupported {algorithm=}")
 
 
 def inference_and_learning_share_gpus(inference_gpus: list[int], learning_gpus: list[int]) -> bool:

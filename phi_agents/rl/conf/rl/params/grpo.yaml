@@ -1,0 +1,9 @@
+defaults:
+  - default
+
+algorithm: grpo
+total_iterations: 200
+loss_type: pg_per_token
+do_ppo_clipping: True
+ppo_epsilon: 0.1
+rloo_kl_lambda: 0.0
