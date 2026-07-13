@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -15,15 +16,25 @@ from phi_agents.sft.trainer import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 
 @pytest.fixture(autouse=True)
-def _force_cpu_without_cuda_driver(monkeypatch: Any) -> None:
+def _force_cpu_without_cuda_driver(monkeypatch: Any) -> Iterator[None]:
     """Keep this regression test independent of workstation CUDA driver health."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
     monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda seed: None)
+    from phi_agents.utils.logger import get_phi_logger
+
+    logger = get_phi_logger()
+    production_handlers = list(logger.handlers)
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    yield
+    logger.handlers.clear()
+    logger.handlers.extend(production_handlers)
 
 
 def _gradient_capture() -> Any:
@@ -352,5 +363,7 @@ def test_tiny_sft_train_backward_and_checkpoint_smoke(tmp_path: Path, monkeypatc
     assert (checkpoint / "optimizer.pt").is_file()
     assert (checkpoint / "scheduler.pt").is_file()
     assert (checkpoint / "rng_state.pth").is_file()
+    assert (checkpoint / "lora" / "adapter_config.json").is_file()
     assert (output_dir / "final_adapter" / "adapter_config.json").is_file()
+    assert (output_dir / "lora" / "adapter_config.json").is_file()
     assert (output_dir / "train_metrics.json").is_file()

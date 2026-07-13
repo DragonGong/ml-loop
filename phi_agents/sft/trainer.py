@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
+import shutil
+import signal
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
@@ -13,6 +16,20 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+from phi_agents.utils.logger import get_phi_logger
+
+logger = get_phi_logger()
+
+LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
 
 @dataclass(frozen=True)
 class SFTConfig:
@@ -20,25 +37,36 @@ class SFTConfig:
     validation_jsonl: Path
     output_dir: Path
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_path: Path | None = None
     max_length: int = 16_384
     turn_overlap: int = 0
     preserve_history: bool = True
     audit_supervision: bool = True
-    lora_rank: int = 64
-    lora_alpha: int = 128
-    lora_dropout: float = 0.0
-    learning_rate: float = 2e-5
+    lora_rank: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+    learning_rate: float = 5e-5
     epochs: float = 2.0
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 8
     gradient_checkpointing: bool = True
     bf16: bool = True
+    tf32: bool = True
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    lr_scheduler_type: str = "cosine"
+    warmup_ratio: float = 0.05
+    attention_backend: str = "auto"
     logging_steps: int = 5
     save_steps: int = 50
     eval_steps: int = 50
-    seed: int = 42
+    seed: int = 20_260_713
     resume_from_checkpoint: str | None = None
+    initial_adapter: Path | None = None
+    max_steps: int = -1
+    max_train_samples: int | None = None
+    max_validation_samples: int | None = None
     use_cpu: bool = False
 
 
@@ -52,6 +80,24 @@ def _data_digest(paths: tuple[Path, ...]) -> str:
     for path in paths:
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def _directory_digest(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    for child in sorted(item for item in path.rglob("*") if item.is_file()):
+        digest.update(str(child.relative_to(path)).encode())
+        digest.update(child.read_bytes())
+    return digest.hexdigest()
+
+
+def _attention_backend(config: SFTConfig) -> str:
+    if config.attention_backend != "auto":
+        return config.attention_backend
+    if torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None:
+        return "flash_attention_2"
+    return "sdpa"
 
 
 def tokenize_messages(
@@ -450,9 +496,67 @@ def artifact_manifest_callback(manifest: dict[str, Any]) -> Any:
     from transformers import TrainerCallback
 
     class ArtifactManifestCallback(TrainerCallback):
+        def on_log(
+            self,
+            args: Any,
+            state: Any,
+            control: Any,
+            logs: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            logs = logs or {}
+            if "loss" in logs:
+                logger.info(
+                    "SFT training progress (step=%s, epoch=%s, loss=%s)",
+                    state.global_step,
+                    state.epoch,
+                    logs["loss"],
+                    extra={"event": "training_progress"},
+                )
+            if "eval_loss" in logs:
+                logger.info(
+                    "SFT validation completed (step=%s, epoch=%s, validation_loss=%s)",
+                    state.global_step,
+                    state.epoch,
+                    logs["eval_loss"],
+                    extra={"event": "validation_completed"},
+                )
+
         def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-            path = Path(args.output_dir) / f"checkpoint-{state.global_step}" / "sft_artifact.json"
-            path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+            checkpoint_manifest = {
+                **manifest,
+                "checkpoint": {
+                    "global_step": state.global_step,
+                    "epoch": state.epoch,
+                    "path": str(checkpoint.resolve()),
+                },
+            }
+            (checkpoint / "sft_artifact.json").write_text(
+                json.dumps(checkpoint_manifest, indent=2, sort_keys=True) + "\n"
+            )
+            lora_dir = checkpoint / "lora"
+            lora_dir.mkdir(exist_ok=True)
+            for filename in (
+                "adapter_config.json",
+                "adapter_model.safetensors",
+                "README.md",
+            ):
+                source = checkpoint / filename
+                if source.is_file():
+                    shutil.copy2(source, lora_dir / filename)
+            if state.epoch is not None and abs(state.epoch - round(state.epoch)) < 1e-6:
+                epoch_link = Path(args.output_dir) / f"epoch-{round(state.epoch)}"
+                if epoch_link.is_symlink():
+                    epoch_link.unlink()
+                if not epoch_link.exists():
+                    epoch_link.symlink_to(checkpoint.name, target_is_directory=True)
+            logger.info(
+                "SFT checkpoint saved (step=%s, epoch=%s)",
+                state.global_step,
+                state.epoch,
+                extra={"event": "training_checkpoint_saved"},
+            )
 
     return ArtifactManifestCallback()
 
@@ -462,6 +566,12 @@ def prepare_windows(
 ) -> tuple[list[Any], list[Any], dict[str, Any]]:
     train_samples = _read_jsonl(config.train_jsonl)
     validation_samples = _read_jsonl(config.validation_jsonl)
+    source_train_samples = len(train_samples)
+    source_validation_samples = len(validation_samples)
+    if config.max_train_samples is not None:
+        train_samples = train_samples[: config.max_train_samples]
+    if config.max_validation_samples is not None:
+        validation_samples = validation_samples[: config.max_validation_samples]
     if not config.preserve_history:
         warnings.warn(
             "preserve_history=False is a risky legacy mode: later windows may not contain the "
@@ -510,6 +620,8 @@ def prepare_windows(
     combined_audit = Counter(train_audit) + Counter(validation_audit)
     trajectory_count = len(train_samples) + len(validation_samples)
     stats = {
+        "source_train_samples": source_train_samples,
+        "source_validation_samples": source_validation_samples,
         "train_samples": len(train_samples),
         "validation_samples": len(validation_samples),
         "train_windows": len(train),
@@ -544,51 +656,85 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    logger.info(
+        "Preparing AppWorld SFT data (output_dir=%s)",
+        config.output_dir,
+        extra={"event": "training_data_preparation_started"},
+    )
+    model_source = str(config.model_path or config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     train_rows, validation_rows, stats = prepare_windows(config, tokenizer)
+    selected_attention_backend = _attention_backend(config)
     manifest = {
         "sft_config": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in asdict(config).items()
         },
         "data_sha256": _data_digest((config.train_jsonl, config.validation_jsonl)),
+        "train_data_sha256": hashlib.sha256(config.train_jsonl.read_bytes()).hexdigest(),
+        "validation_data_sha256": hashlib.sha256(config.validation_jsonl.read_bytes()).hexdigest(),
         "data_stats": stats,
         "base_model": config.model_name,
+        "base_model_path": str(config.model_path.resolve()) if config.model_path else None,
         "adapter_kind": "lora",
+        "initial_adapter_sha256": _directory_digest(config.initial_adapter),
+        "attention_backend": selected_attention_backend,
+        "packing": False,
+        "lora_target_modules": LORA_TARGET_MODULES,
         "loop_compatible": True,
     }
     (config.output_dir / "sft_artifact.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
+    logger.info(
+        "AppWorld SFT supervision audit passed "
+        "(train_windows=%s, validation_windows=%s, supervised_tokens=%s, legacy_samples=%s)",
+        stats["train_windows"],
+        stats["validation_windows"],
+        stats["assistant_tokens"],
+        stats["legacy_samples_without_step_metadata"],
+        extra={"event": "training_data_audited"},
+    )
     if tokenize_only:
         return manifest
 
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-    )
-    lora = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        bias="none",
-    )
-    model = get_peft_model(model, lora)
+    model_kwargs = {
+        "dtype": torch.bfloat16 if config.bf16 else torch.float32,
+        "attn_implementation": selected_attention_backend,
+    }
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_source, **model_kwargs)
+    except (ImportError, RuntimeError, ValueError):
+        if selected_attention_backend != "flash_attention_2":
+            raise
+        selected_attention_backend = "sdpa"
+        model_kwargs["attn_implementation"] = selected_attention_backend
+        manifest["attention_backend"] = selected_attention_backend
+        (config.output_dir / "sft_artifact.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+        logger.warning(
+            "Flash Attention 2 was unavailable; falling back to SDPA.",
+            extra={"event": "attention_backend_fallback"},
+        )
+        model = AutoModelForCausalLM.from_pretrained(model_source, **model_kwargs)
+    if config.initial_adapter is None:
+        lora = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=LORA_TARGET_MODULES,
+            bias="none",
+        )
+        model = get_peft_model(model, lora)
+    else:
+        model = PeftModel.from_pretrained(model, config.initial_adapter, is_trainable=True)
     if config.gradient_checkpointing:
         model.enable_input_require_grads()
         model.config.use_cache = False
@@ -599,20 +745,33 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
     ):
         raise RuntimeError("A non-LoRA model parameter is unexpectedly trainable")
 
+    enable_tf32 = config.tf32 and torch.cuda.is_available() and not config.use_cpu
+    if torch.cuda.is_available() and not config.use_cpu:
+        torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+        torch.backends.cudnn.allow_tf32 = enable_tf32
+
     arguments = TrainingArguments(
         output_dir=str(config.output_dir),
         num_train_epochs=config.epochs,
+        max_steps=config.max_steps,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         learning_rate=config.learning_rate,
+        lr_scheduler_type=config.lr_scheduler_type,
+        warmup_ratio=config.warmup_ratio,
+        optim="adamw_torch",
+        weight_decay=config.weight_decay,
+        max_grad_norm=config.max_grad_norm,
         bf16=config.bf16,
+        tf32=enable_tf32,
         logging_steps=config.logging_steps,
         save_steps=config.save_steps,
         eval_steps=config.eval_steps,
-        eval_strategy="steps" if validation_rows else "no",
-        save_strategy="steps",
+        eval_strategy="epoch" if validation_rows else "no",
+        save_strategy="epoch",
         save_total_limit=3,
         report_to="wandb" if os.environ.get("WANDB_PROJECT") else "none",
         seed=config.seed,
@@ -628,17 +787,58 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         data_collator=AssistantOnlyCollator(tokenizer.pad_token_id),
         callbacks=[artifact_manifest_callback(manifest)],
     )
+    if torch.cuda.is_available() and not config.use_cpu:
+        torch.cuda.reset_peak_memory_stats()
+    logger.info(
+        "AppWorld LoRA SFT started "
+        "(train_windows=%s, epochs=%s, accumulation=%s, attention_backend=%s)",
+        len(train_rows),
+        config.epochs,
+        config.gradient_accumulation_steps,
+        selected_attention_backend,
+        extra={"event": "training_started"},
+    )
     result = trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
-    eval_metrics = trainer.evaluate() if validation_rows else {}
+    eval_metrics = next(
+        (
+            {key: value for key, value in entry.items() if key.startswith("eval_")}
+            for entry in reversed(trainer.state.log_history)
+            if "eval_loss" in entry
+        ),
+        {},
+    )
+    if validation_rows and not eval_metrics:
+        eval_metrics = trainer.evaluate()
     trainer.save_model(str(config.output_dir / "final_adapter"))
+    trainer.save_model(str(config.output_dir / "lora"))
     trainer.save_state()
     metrics = {**result.metrics, **eval_metrics, **stats}
     runtime = float(result.metrics.get("train_runtime") or 0.0)
+    completed_epochs = float(trainer.state.epoch or 0.0)
+    metrics["optimizer_steps"] = trainer.state.global_step
+    metrics["completed_epochs"] = completed_epochs
+    metrics["effective_supervised_tokens_per_epoch"] = stats["assistant_tokens"]
+    metrics["effective_supervised_token_exposures"] = int(
+        stats["assistant_tokens"] * completed_epochs
+    )
+    metrics["peak_gpu_memory_bytes"] = (
+        torch.cuda.max_memory_allocated() if torch.cuda.is_available() and not config.use_cpu else 0
+    )
+    metrics["attention_backend"] = selected_attention_backend
     metrics["train_tokens_per_second"] = (
-        stats["total_tokens"] * config.epochs / runtime if runtime else 0.0
+        stats["total_tokens"] * completed_epochs / runtime if runtime else 0.0
     )
     (config.output_dir / "train_metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n"
+    )
+    logger.info(
+        "AppWorld LoRA SFT completed "
+        "(optimizer_steps=%s, train_loss=%s, validation_loss=%s, runtime_seconds=%s)",
+        metrics["optimizer_steps"],
+        metrics.get("train_loss"),
+        metrics.get("eval_loss"),
+        runtime,
+        extra={"event": "training_completed"},
     )
     return {**manifest, "metrics": metrics}
 
@@ -649,6 +849,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-jsonl", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model-path", type=Path)
     parser.add_argument("--max-length", type=int, default=16_384)
     parser.add_argument("--turn-overlap", type=int, default=0)
     parser.add_argument(
@@ -662,12 +863,51 @@ def parse_args() -> argparse.Namespace:
         help="Disable exactly-once step supervision validation (not recommended).",
     )
     parser.add_argument("--epochs", type=float, default=2.0)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--lora-alpha", type=int, default=64)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--lr-scheduler-type", default="cosine")
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--attention-backend", choices=("auto", "sdpa", "flash_attention_2"), default="auto"
+    )
+    parser.add_argument("--seed", type=int, default=20_260_713)
+    parser.add_argument("--logging-steps", type=int, default=5)
+    parser.add_argument("--initial-adapter", type=Path)
     parser.add_argument("--resume-from-checkpoint", default=None)
+    parser.add_argument("--max-steps", type=int, default=-1)
+    parser.add_argument("--max-train-samples", type=int)
+    parser.add_argument("--max-validation-samples", type=int)
+    parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--tokenize-only", action="store_true")
     parser.add_argument("--use-cpu", action="store_true")
     return parser.parse_args()
+
+
+class TrainingTerminated(RuntimeError):
+    pass
+
+
+def _install_termination_handlers() -> dict[signal.Signals, Any]:
+    previous: dict[signal.Signals, Any] = {}
+
+    def terminate(signum: int, frame: Any) -> None:
+        del frame
+        raise TrainingTerminated(signal.Signals(signum).name)
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, terminate)
+    return previous
+
+
+def _restore_termination_handlers(previous: dict[signal.Signals, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 def main() -> None:
@@ -677,17 +917,59 @@ def main() -> None:
         validation_jsonl=args.validation_jsonl,
         output_dir=args.output_dir,
         model_name=args.model_name,
+        model_path=args.model_path,
         max_length=args.max_length,
         turn_overlap=args.turn_overlap,
         preserve_history=not args.disable_history_context,
         audit_supervision=not args.disable_supervision_audit,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        tf32=not args.disable_tf32,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_ratio=args.warmup_ratio,
+        attention_backend=args.attention_backend,
+        seed=args.seed,
+        logging_steps=args.logging_steps,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        initial_adapter=args.initial_adapter,
+        max_steps=args.max_steps,
+        max_train_samples=args.max_train_samples,
+        max_validation_samples=args.max_validation_samples,
         use_cpu=args.use_cpu,
     )
-    print(json.dumps(train(config, tokenize_only=args.tokenize_only), indent=2, sort_keys=True))
+    previous_handlers = _install_termination_handlers()
+    try:
+        result = train(config, tokenize_only=args.tokenize_only)
+        print(json.dumps(result, indent=2, sort_keys=True))
+    except torch.cuda.OutOfMemoryError:
+        logger.critical(
+            "AppWorld SFT failed because CUDA ran out of memory.",
+            exc_info=True,
+            extra={"event": "cuda_oom"},
+        )
+        raise
+    except (KeyboardInterrupt, TrainingTerminated) as exc:
+        logger.critical(
+            "AppWorld SFT training was interrupted (%s).",
+            type(exc).__name__,
+            extra={"event": "training_failed"},
+        )
+        raise
+    except BaseException:
+        logger.critical(
+            "AppWorld SFT training failed.",
+            exc_info=True,
+            extra={"event": "training_failed"},
+        )
+        raise
+    finally:
+        _restore_termination_handlers(previous_handlers)
 
 
 if __name__ == "__main__":

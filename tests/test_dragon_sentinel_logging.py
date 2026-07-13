@@ -8,6 +8,7 @@ from phi_agents.utils.logger import (
     DRAGON_SENTINEL_LOG_PATH,
     SafeWatchedFileHandler,
     create_dragon_sentinel_handler,
+    redact_log_text,
 )
 
 REQUIRED_FIELDS = {
@@ -117,11 +118,16 @@ def test_secrets_and_personal_information_are_redacted(tmp_path: Path) -> None:
     assert "[REDACTED_IP]" in raw_log
 
 
+def test_decimal_training_metrics_are_not_misclassified_as_phone_numbers() -> None:
+    safe = redact_log_text("runtime_seconds=976.0763 validation_loss=0.320944607257843")
+
+    assert safe == "runtime_seconds=976.0763 validation_loss=0.320944607257843"
+    assert redact_log_text("call +86 138-1234-5678") == "call [REDACTED_PHONE]"
+
+
 def test_default_path_and_rotation() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    assert DRAGON_SENTINEL_LOG_PATH == Path(
-        "/var/log/dragon-sentinel/appworld/appworld.jsonl"
-    )
+    assert DRAGON_SENTINEL_LOG_PATH == Path("/var/log/dragon-sentinel/appworld/appworld.jsonl")
 
     rotation = (project_root / ".dragonsentinel/logrotate.conf").read_text(encoding="utf-8")
     assert str(DRAGON_SENTINEL_LOG_PATH) in rotation
@@ -132,9 +138,7 @@ def test_default_path_and_rotation() -> None:
     assert "create 0640" in rotation
 
 
-def test_file_handler_failure_never_echoes_raw_record(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_file_handler_failure_never_echoes_raw_record(tmp_path: Path, monkeypatch, capsys) -> None:
     handler = create_dragon_sentinel_handler(tmp_path / "appworld.jsonl")
     assert isinstance(handler, SafeWatchedFileHandler)
 

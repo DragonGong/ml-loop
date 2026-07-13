@@ -37,6 +37,7 @@ fi
 "$PYTHON_BIN" -m scripts.appworld.eval_parse_and_log \
   experiment_name="$EXPERIMENT_NAME" \
   llm="$LLM_CONFIG" \
-  scenario_sampler.dataset_name="$SPLIT"
+  scenario_sampler.dataset_name="$SPLIT" \
+  "${@:4}"
 
 "$PYTHON_BIN" -m scripts.loop7b.summarize_appworld_episodes "$EXPERIMENT_NAME"

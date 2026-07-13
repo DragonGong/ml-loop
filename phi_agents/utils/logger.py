@@ -41,9 +41,7 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?:(?P<quote>['\"])(?P<quoted>.*?)(?P=quote)|(?P<plain>[^\s,;}\]]+))"
 )
 _AUTHORIZATION_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
-_COOKIE_HEADER_RE = re.compile(
-    r"(?im)\b(?P<header>set-cookie|cookie)\b['\"]?\s*[:=]\s*[^\r\n]*"
-)
+_COOKIE_HEADER_RE = re.compile(r"(?im)\b(?P<header>set-cookie|cookie)\b['\"]?\s*[:=]\s*[^\r\n]*")
 _WEBHOOK_URL_RE = re.compile(r"(?i)https?://[^\s'\"]*(?:webhook|hooks)[^\s'\"]*")
 _BARE_CREDENTIAL_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
@@ -64,7 +62,9 @@ _IP_ADDRESS_RE = re.compile(
     r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
     r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
 )
-_PHONE_RE = re.compile(r"(?<![\w.])\+?\d(?:[\s().-]*\d){6,14}(?![\w.])")
+_PHONE_RE = re.compile(
+    r"(?<![\w.])(?:\+?\d(?:[\s()-]*\d){6,14}|\d{2,4}(?:\.\d{2,4}){2,3})(?![\w.])"
+)
 _HOME_PATH_RE = re.compile(r"(?i)(?P<prefix>/(?:home|users)/)[^/\s]+")
 
 
@@ -77,9 +77,7 @@ def _redact_assignment(match: re.Match[str]) -> str:
 def redact_log_text(value: Any) -> str:
     """Return a log-safe string with common secrets and personal identifiers removed."""
     text = str(value)
-    text = _COOKIE_HEADER_RE.sub(
-        lambda match: f"{match.group('header')}: {REDACTED}", text
-    )
+    text = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group('header')}: {REDACTED}", text)
     text = _AUTHORIZATION_RE.sub(lambda match: f"{match.group(1)} {REDACTED}", text)
     text = _WEBHOOK_URL_RE.sub(REDACTED, text)
     text = _SENSITIVE_ASSIGNMENT_RE.sub(_redact_assignment, text)
