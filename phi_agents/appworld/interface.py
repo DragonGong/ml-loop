@@ -291,7 +291,9 @@ class AppWorldInterface:
             response.raise_for_status()
         except requests.HTTPError as exception:
             logger.exception(
-                f"AppWorld remote environment call to method '{method_name}' failed: {response.text}."
+                "AppWorld remote environment call to method '%s' failed with status %s.",
+                method_name,
+                response.status_code,
             )
             raise exception
 

@@ -91,7 +91,7 @@ def extract_code_format_output(msg_content: str) -> str:
         output_code += partial_m.group(2).strip()
         # terminated due to stop condition. Add stop condition to output.
     if len(output_code) == 0:
-        logger.info(f"No code found in action: {msg_content}")
+        logger.info("No code found in generated action (chars=%s)", len(msg_content))
         return ""
     else:
         return output_code

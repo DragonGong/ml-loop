@@ -6,7 +6,6 @@
 import dataclasses
 import io
 import json
-import logging
 import os
 import re
 import shutil
@@ -28,6 +27,8 @@ import fsspec
 import lz4.frame
 from boto3 import Session as Boto3Session
 
+from phi_agents.utils.logger import get_phi_logger
+
 __path_to_str_re = re.compile(r"^(?P<scheme>\w+?):/(?P<nonslash>[^/])")
 
 
@@ -37,8 +38,7 @@ AWS_PROFILE = os.environ.get("AWS_PROFILE")  # e.g. "default" or "your-profile"
 # Thread-local cache to avoid redundant session creation
 thread_local_cache = threading.local()
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.environ.get("LOG_LEVEL", logging.INFO))
+logger = get_phi_logger()
 
 
 def filesystem_for_scheme(scheme: str) -> Any:

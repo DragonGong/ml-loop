@@ -176,23 +176,30 @@ class VLLMClient:
             ) as r:
                 try:
                     r.raise_for_status()
-                except requests.HTTPError as error:
-                    print(
-                        f"vLLM server request failed {r.text} {r.status_code=}\n\njson_args:\n{args}"
+                except requests.HTTPError:
+                    logger.error(
+                        "vLLM HTTP request failed (status_code=%s, response_chars=%s)",
+                        r.status_code,
+                        len(r.text),
                     )
-                    json_dict = r.json()
-                    if r.status_code == 400 and json_dict["message"].startswith(
+                    try:
+                        json_dict = r.json()
+                    except requests.JSONDecodeError:
+                        json_dict = {}
+                    message = json_dict.get("message", "")
+                    if r.status_code == 400 and isinstance(message, str) and message.startswith(
                         "This model's maximum context length is "
                     ):
-                        raise MaxSeqLenExceeded from error
-                    else:
-                        raise error
+                        raise MaxSeqLenExceeded from None
+                    raise requests.HTTPError(
+                        f"vLLM request failed with HTTP status {r.status_code}"
+                    ) from None
 
                 for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
                     chunks_received += 1
 
                     if self._cancelled():
-                        print(f"VLLM rollout cancelled! {self._url}")
+                        logger.info("vLLM rollout cancelled")
                         cancelled = True
                         break
 
@@ -200,9 +207,13 @@ class VLLMClient:
                         continue
 
                     if not isinstance(chunk, str) or not chunk.startswith(expected_chunk_prefix):
-                        raise ValueError(
-                            f"Expected data chunks in Server-Sent Events (SSE) format, got: {chunk=}, {r.status_code=} {args=}"
+                        logger.error(
+                            "Invalid vLLM SSE chunk (status_code=%s, chunk_type=%s, chunk_chars=%s)",
+                            r.status_code,
+                            type(chunk).__name__,
+                            len(chunk) if isinstance(chunk, bytes | str) else 0,
                         )
+                        raise ValueError("Expected a vLLM Server-Sent Events data chunk") from None
 
                     chunk = chunk[len(expected_chunk_prefix) :].strip()
 
@@ -216,16 +227,23 @@ class VLLMClient:
                     try:
                         data = json.loads(chunk)
                     except Exception as exc:
-                        logger.error(f"Could not parse data {chunk=}, {r.status_code=} {args=}")
+                        logger.error(
+                            "Could not parse vLLM response chunk "
+                            "(status_code=%s, chunk_chars=%s)",
+                            r.status_code,
+                            len(chunk),
+                        )
                         raise exc
 
                     if "error" in data:
-                        logger.error(f"VLLM error: {data=} {chunks_received=}")
-                        logger.error(f"json_args: {args}")
+                        logger.error(
+                            "vLLM returned an error payload (chunks_received=%s)", chunks_received
+                        )
 
                     if "choices" not in data or len(data["choices"]) != 1:
                         logger.error(
-                            f"VLLM error: Invalid data format (no 'choices'?) {data=} {chunks_received=}"
+                            "VLLM error: invalid response choice count (chunks_received=%s)",
+                            chunks_received,
                         )
                         break
 
@@ -234,7 +252,7 @@ class VLLMClient:
                     choice = choices[0]
 
                     if "finish_reason" not in choice:
-                        logger.error(f"VLLM error: Invalid choice format {choice=}")
+                        logger.error("VLLM error: response choice has no finish_reason")
                         break
 
                     if choice["finish_reason"] is not None:
@@ -251,9 +269,13 @@ class VLLMClient:
         assert len(generated_tokens) == len(generated_log_probs)
 
         if not cancelled and len(generated_tokens) <= 1:
-            logger.error(f"VLLM error: {len(generated_tokens)} tokens generated {args=}")
+            logger.error("VLLM error: only %s token(s) generated", len(generated_tokens))
             logger.error(
-                f"{generated_tokens} {generated_log_probs} {text_chunks} {chunks_received}"
+                "VLLM generation details omitted from logs "
+                "(log_probs=%s, text_chunks=%s, chunks_received=%s)",
+                len(generated_log_probs),
+                len(text_chunks),
+                chunks_received,
             )
 
         return full_text, generated_tokens, generated_log_probs, max_tokens_stopped, cancelled

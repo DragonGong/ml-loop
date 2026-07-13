@@ -55,7 +55,7 @@ def find_existing_vllm_process(port: int) -> psutil.Process | None:
                 continue
 
             if serve_idx > 0 and "vllm" in cmd[serve_idx - 1]:
-                logger.info(f"{proc=} {proc.info['cmdline']=}")
+                logger.info("Found candidate vLLM process (pid=%s)", proc.pid)
 
                 # Search for `--port` followed by our target port
                 for i in range(len(cmd) - 1):
@@ -331,8 +331,12 @@ class VLLMServer:
 
         kill_process_by_port(str(self.port))
         logger.info(f"Launching vllm subprocess {self._url}...")
-        logger.info(args)
-        logger.info(f"{env=}")
+        logger.info(
+            "vLLM launch arguments and environment omitted from logs "
+            "(argument_count=%s, environment_variable_count=%s)",
+            len(args),
+            len(env),
+        )
         _popen = subprocess.Popen(args, env=env)
         self._process = psutil.Process(_popen.pid) if _popen else None
         logger.info(f"{_popen=} {self._process=}")

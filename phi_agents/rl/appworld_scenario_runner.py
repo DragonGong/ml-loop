@@ -458,7 +458,10 @@ class AppWorldScenarioRunner(ScenarioRunner):
         self._check_health_after_task(task_id)
 
         if sum(msg.ipython for msg in messages if isinstance(msg, PolicyMessage)) > 0:
-            logger.warning(f"got <|python_tag|> in rollout: {messages}")
+            logger.warning(
+                "Rollout contained <|python_tag|>; transcript omitted from logs (turns=%s)",
+                len(messages),
+            )
 
         appworld_rollout_data = AppWorldRolloutData.from_episode(episode, scenario.dataset_name)
 

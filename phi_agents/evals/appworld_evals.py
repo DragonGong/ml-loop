@@ -275,7 +275,9 @@ def _run_vllm_inference_single_server_single_task(
         try:
             output = world.execute(code)
         except AppWorldExecutionError:
-            logger.exception(f"Found AppWorldExecutionError when running code:\n{code}")
+            logger.exception(
+                "Found AppWorldExecutionError while running generated code (chars=%s)", len(code)
+            )
             raise
 
         if no_code_found(code):

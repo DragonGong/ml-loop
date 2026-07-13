@@ -8,7 +8,6 @@
 results into a pandas Dataframe.
 """
 
-import logging
 import subprocess
 import sys
 from datetime import datetime
@@ -22,8 +21,9 @@ import pandas as pd
 import phi_agents.rl.config  # noqa: F401
 import phi_agents.utils.file_utils as fu
 from phi_agents.inference.config import MainInferenceConfig
+from phi_agents.utils.logger import get_phi_logger
 
-logger = logging.getLogger(__name__)
+logger = get_phi_logger()
 
 
 DEFAULT_APPWORLD_EXE = "appworld-env/bin/appworld"

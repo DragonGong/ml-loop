@@ -21,7 +21,6 @@ from phi_agents.appworld.interface import AppWorldInterface, AppWorldTaskEvalRes
 from phi_agents.evals.appworld_evals import AppworldAgent, RolloutCancelled, execution_failed
 from phi_agents.evals.appworld_evals import no_code_found as no_code_found_fn
 from phi_agents.rl.llm import TrainableLLM
-from phi_agents.rl.llm.base_llm import messages_str
 from phi_agents.rl.type_defs import (
     AssistantMessage,
     IPythonMessage,
@@ -99,7 +98,9 @@ def rewrite_task(llm: TrainableLLM, message: str) -> str:
     ]
     rewritten_task = llm.generate(messages).content
     logger.info(
-        f"-------------------\nOriginal task: {message}\nRewritten task: {rewritten_task}\n--------"
+        "Task rewrite completed (original_chars=%s, rewritten_chars=%s)",
+        len(message),
+        len(rewritten_task),
     )
     return rewritten_task
 
@@ -128,7 +129,7 @@ def _look_backward_for_newline_or_whitespace(appworld_output: str, cutoff_idx: i
         logger.info(
             "Agent truncation: Did not find newline character prior to the cutoff for truncation"
         )
-        logger.info(appworld_output)
+        logger.info("AppWorld output omitted from logs (chars=%s)", len(appworld_output))
 
         # Truncate at space (' ') character instead
         idx = appworld_output.rfind(" ", 0, cutoff_idx)
@@ -366,7 +367,15 @@ class MinimalReactAgent(AppworldAgent):
                             break
                         elif not is_valid and attempt_idx >= self.n_search_retries - 1:
                             logger.info(
-                                f"Invalid message:\n {possible_msg.content}, result: {possible_msg_result.output}, attempt took {generation_time:.2f}+{execution_time:.2f} s, {attempt_idx + 1}/{self.n_search_retries}"
+                                "Invalid generated action "
+                                "(action_chars=%s, result_chars=%s, generation_seconds=%.2f, "
+                                "execution_seconds=%.2f, attempt=%s/%s)",
+                                len(possible_msg.content),
+                                len(possible_msg_result.output),
+                                generation_time,
+                                execution_time,
+                                attempt_idx + 1,
+                                self.n_search_retries,
                             )
 
                     if len(possible_msgs) == 0:
@@ -443,7 +452,7 @@ class MinimalReactAgent(AppworldAgent):
             logger.info(
                 f"We've failed to truncate properly, total len {n_characters(task_messages)=}"
             )
-            logger.info(messages_str(task_messages))
+            logger.info("Truncated task transcript omitted from logs (turns=%s)", len(task_messages))
 
         return prompt + task_messages
 

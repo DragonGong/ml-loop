@@ -1912,7 +1912,7 @@ class RLOOTrainer:
 
 
 def main() -> int:
-    logger.info(sys.argv[1:])
+    logger.info("Starting training with %s CLI override(s)", len(sys.argv) - 1)
     _cfg = get_config(mode="train", overrides=sys.argv[1:])
 
     import pynvml
