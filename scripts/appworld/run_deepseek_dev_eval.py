@@ -111,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--api-retries", type=int, default=None)
     parser.add_argument("--request-timeout-seconds", type=float, default=None)
+    parser.add_argument("--absolute-request-timeout-seconds", type=float, default=None)
     parser.add_argument("--request-interval-seconds", type=float, default=None)
     parser.add_argument("--retry-backoff-seconds", type=float, default=None)
     parser.add_argument(
@@ -156,6 +157,7 @@ def main() -> None:
         max_tokens=args.max_tokens,
         max_retries=args.api_retries,
         request_timeout_seconds=args.request_timeout_seconds,
+        absolute_request_timeout_seconds=args.absolute_request_timeout_seconds,
         request_interval_seconds=args.request_interval_seconds,
         retry_backoff_seconds=args.retry_backoff_seconds,
     )

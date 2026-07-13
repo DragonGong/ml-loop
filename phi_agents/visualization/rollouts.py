@@ -131,6 +131,7 @@ def convert_rollout_to_episode(
         num_prompt_messages=rollout.appworld_rollout_data.num_prompt_messages,
         n_execution_failed=rollout.appworld_rollout_data.n_execution_failed,
         n_no_code_found=rollout.appworld_rollout_data.n_no_code_found,
+        context_truncated=rollout.appworld_rollout_data.context_truncated,
         cancelled=False,
     )
 

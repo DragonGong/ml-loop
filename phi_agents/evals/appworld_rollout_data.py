@@ -36,6 +36,7 @@ class AppWorldRolloutData:
     num_prompt_messages: int | None
     n_execution_failed: int
     n_no_code_found: int
+    context_truncated: bool = False
 
     @classmethod
     def from_episode(cls, episode: Episode, dataset_name: str) -> Self:
@@ -49,6 +50,7 @@ class AppWorldRolloutData:
             num_prompt_messages=episode.num_prompt_messages,
             n_execution_failed=episode.n_execution_failed,
             n_no_code_found=episode.n_no_code_found,
+            context_truncated=episode.context_truncated,
         )
 
 
@@ -67,6 +69,8 @@ class AppWorldTrainingRollout(TrainingRollout):
             rollout_yaml["appworld_rollout_data"]["n_execution_failed"] = -1
         if "n_no_code_found" not in rollout_yaml["appworld_rollout_data"]:
             rollout_yaml["appworld_rollout_data"]["n_no_code_found"] = -1
+        if "context_truncated" not in rollout_yaml["appworld_rollout_data"]:
+            rollout_yaml["appworld_rollout_data"]["context_truncated"] = False
         rollout = cls(**rollout_yaml)
         rollout.appworld_rollout_data = converter.structure(
             rollout.appworld_rollout_data, AppWorldRolloutData

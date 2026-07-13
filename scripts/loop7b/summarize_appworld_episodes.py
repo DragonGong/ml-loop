@@ -37,6 +37,7 @@ class EpisodeStats:
     n_no_code_found: int
     cancelled: bool
     invalid_api_hits: int
+    context_truncated: bool
 
 
 def _episode_paths(appworld_root: Path, experiment_name: str) -> list[Path]:
@@ -85,6 +86,7 @@ def _load_episode(path: Path, patterns: list[re.Pattern[str]]) -> EpisodeStats:
         n_no_code_found=int(episode.get("n_no_code_found") or 0),
         cancelled=bool(episode.get("cancelled")),
         invalid_api_hits=_count_invalid_api_hits(episode, patterns),
+        context_truncated=bool(episode.get("context_truncated")),
     )
 
 
@@ -105,6 +107,7 @@ def summarize(appworld_root: Path, experiment_name: str, patterns: list[re.Patte
     no_code_total = sum(item.n_no_code_found for item in stats)
     invalid_api_total = sum(item.invalid_api_hits for item in stats)
     cancelled_total = sum(item.cancelled for item in stats)
+    context_truncated_total = sum(item.context_truncated for item in stats)
     interactions = [item.num_interactions for item in stats if item.num_interactions is not None]
     avg_interactions = (sum(interactions) / len(interactions)) if interactions else 0.0
 
@@ -120,6 +123,7 @@ def summarize(appworld_root: Path, experiment_name: str, patterns: list[re.Patte
     print(f"invalid_api_regex_hits: {invalid_api_total}")
     print(f"invalid_api_task_rate: {_format_rate(sum(s.invalid_api_hits > 0 for s in stats), n)}")
     print(f"cancelled_total: {cancelled_total}")
+    print(f"context_truncation_rate: {_format_rate(context_truncated_total, n)}")
 
 
 def parse_args() -> argparse.Namespace:

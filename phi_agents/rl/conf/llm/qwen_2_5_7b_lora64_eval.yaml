@@ -1,0 +1,9 @@
+defaults:
+- qwen_2_5_7b_eval
+
+vllm_server:
+  max_lora_rank: 64
+
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.0

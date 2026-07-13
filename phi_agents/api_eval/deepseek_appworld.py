@@ -10,12 +10,16 @@ import json
 import os
 import random
 import re
+import signal
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import httpx
 import requests
 from jinja2 import Template
 from openai import OpenAI
@@ -41,6 +45,9 @@ DEV_SPLIT_NAME = "dev"
 DEV_SPLIT_PATH = Path("data/appworld_splits/dev.txt")
 SUPPORTED_SPLIT_PATHS: dict[str, Path] = {
     DEV_SPLIT_NAME: DEV_SPLIT_PATH,
+    "train_difficulty_1_2": Path("data/appworld_splits/train_difficulty_1_2.txt"),
+    "train_difficulty_3": Path("data/appworld_splits/train_difficulty_3.txt"),
+    "train": Path("data/appworld_splits/train.txt"),
     "test_normal": Path("data/appworld_splits/test_normal.txt"),
     "test_challenge": Path("data/appworld_splits/test_challenge.txt"),
 }
@@ -53,6 +60,10 @@ ReasoningEffortOverride = Literal["profile", "high", "max", "none"]
 
 class DeepSeekRequestError(RuntimeError):
     """Raised when a DeepSeek API request fails after retries."""
+
+
+class DeepSeekAbsoluteTimeout(TimeoutError):
+    """Raised when a DeepSeek request exceeds its wall-clock deadline."""
 
 
 class CostLimitExceeded(RuntimeError):
@@ -151,6 +162,7 @@ class DeepSeekProfile:
     max_tokens: int = 4096
     max_retries: int = 5
     request_timeout_seconds: float = 180.0
+    absolute_request_timeout_seconds: float = 300.0
     request_interval_seconds: float = 1.0
     retry_backoff_seconds: float = 2.0
 
@@ -209,6 +221,7 @@ class DeepSeekProfileOverrides:
     max_tokens: int | None = None
     max_retries: int | None = None
     request_timeout_seconds: float | None = None
+    absolute_request_timeout_seconds: float | None = None
     request_interval_seconds: float | None = None
     retry_backoff_seconds: float | None = None
 
@@ -240,6 +253,9 @@ class AppWorldApiEvalSettings:
     task_retries: int = 2
     resume: bool = True
     cost_limit_cny: float | None = DEFAULT_COST_LIMIT_CNY
+    repair_from_trajectory: Path | None = None
+    persist_reasoning_content: bool = False
+    invalid_response_retries: int = 4
 
 
 @dataclass(frozen=True)
@@ -288,6 +304,8 @@ def build_profile(profile_name: str, overrides: DeepSeekProfileOverrides) -> Dee
         updates["max_retries"] = overrides.max_retries
     if overrides.request_timeout_seconds is not None:
         updates["request_timeout_seconds"] = overrides.request_timeout_seconds
+    if overrides.absolute_request_timeout_seconds is not None:
+        updates["absolute_request_timeout_seconds"] = overrides.absolute_request_timeout_seconds
     if overrides.request_interval_seconds is not None:
         updates["request_interval_seconds"] = overrides.request_interval_seconds
     if overrides.retry_backoff_seconds is not None:
@@ -517,18 +535,76 @@ def truncate_observation(observation: str, max_observation_chars: int | None) ->
     return observation[:remaining_chars] + truncation_msg, True
 
 
+@contextmanager
+def absolute_deadline(seconds: float):
+    """Enforce a wall-clock deadline even when HTTP keep-alives reset read timeouts."""
+    if (
+        seconds <= 0
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "setitimer")
+    ):
+        yield
+        return
+
+    def _raise_timeout(_signum: int, _frame: Any) -> None:
+        raise DeepSeekAbsoluteTimeout(
+            f"DeepSeek request exceeded absolute deadline of {seconds:.1f} seconds"
+        )
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            elapsed = time.monotonic() - started
+            signal.setitimer(
+                signal.ITIMER_REAL,
+                max(1e-6, previous_timer[0] - elapsed),
+                previous_timer[1],
+            )
+
+
 class DeepSeekApiClient:
     def __init__(self, profile: DeepSeekProfile, cost_limit_cny: float | None):
         self.profile = profile
         self.cost_limit_cny = cost_limit_cny
         self.total_cost_cny = 0.0
         self.cost_limit_reached = False
-        self.client = OpenAI(
-            api_key=ensure_deepseek_api_key(),
-            base_url=profile.base_url,
-            timeout=profile.request_timeout_seconds,
-        )
+        self._api_key = ensure_deepseek_api_key()
+        self.client = self._build_client()
         self._last_request_at: float | None = None
+
+    def _build_client(self) -> OpenAI:
+        request_timeout = self.profile.request_timeout_seconds
+        timeout = httpx.Timeout(
+            timeout=request_timeout,
+            connect=min(30.0, request_timeout),
+            read=request_timeout,
+            write=min(60.0, request_timeout),
+            pool=min(30.0, request_timeout),
+        )
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        http_client = httpx.Client(proxy=proxy, timeout=timeout, trust_env=False)
+        return OpenAI(
+            api_key=self._api_key,
+            base_url=self.profile.base_url,
+            timeout=timeout,
+            max_retries=0,
+            http_client=http_client,
+        )
+
+    def _reset_client(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            logger.exception("Failed to close timed-out DeepSeek HTTP client cleanly.")
+        self.client = self._build_client()
 
     def _sleep_for_rate_limit(self) -> None:
         if self.profile.request_interval_seconds <= 0 or self._last_request_at is None:
@@ -564,20 +640,21 @@ class DeepSeekApiClient:
             self._sleep_for_rate_limit()
             start = time.perf_counter()
             try:
-                response = self.client.chat.completions.create(**request_kwargs)
+                with absolute_deadline(self.profile.absolute_request_timeout_seconds):
+                    response = self.client.chat.completions.create(**request_kwargs)
                 self._last_request_at = time.monotonic()
                 request_seconds = time.perf_counter() - start
                 choice = response.choices[0]
                 message = choice.message
                 content = message.content or ""
-                reasoning_content = cast(str | None, getattr(message, "reasoning_content", None))
+                reasoning_content = cast("str | None", getattr(message, "reasoning_content", None))
                 if reasoning_content is None and hasattr(message, "model_extra"):
                     reasoning_content = cast(
-                        str | None,
+                        "str | None",
                         getattr(message, "model_extra", {}).get("reasoning_content"),
                     )
                 usage = jsonable(getattr(response, "usage", None))
-                usage_dict = cast(dict[str, Any] | None, usage)
+                usage_dict = cast("dict[str, Any] | None", usage)
                 cost_estimate = estimate_cost_cny(self.profile.model, usage_dict)
                 if cost_estimate is not None:
                     self.total_cost_cny += cost_estimate.cost_cny
@@ -589,13 +666,17 @@ class DeepSeekApiClient:
                 return DeepSeekChatResponse(
                     content=content,
                     reasoning_content=reasoning_content,
-                    finish_reason=cast(str | None, getattr(choice, "finish_reason", None)),
+                    finish_reason=cast("str | None", getattr(choice, "finish_reason", None)),
                     usage=usage_dict,
                     cost_estimate=cost_estimate,
                     cumulative_cost_cny=self.total_cost_cny,
                     request_seconds=request_seconds,
-                    response_id=cast(str | None, getattr(response, "id", None)),
+                    response_id=cast("str | None", getattr(response, "id", None)),
                 )
+            except DeepSeekAbsoluteTimeout as exc:
+                self._last_request_at = time.monotonic()
+                self._reset_client()
+                raise DeepSeekRequestError(sanitize_api_key(str(exc))) from exc
             except Exception as exc:
                 self._last_request_at = time.monotonic()
                 last_exception = exc
@@ -623,10 +704,12 @@ class DeepSeekReactAgent:
         task: Task,
         client: DeepSeekApiClient,
         max_observation_chars: int | None,
+        invalid_response_retries: int = 4,
     ):
         self.task = task
         self.client = client
         self.max_observation_chars = max_observation_chars
+        self.invalid_response_retries = invalid_response_retries
         self.messages, self.reminder_message = build_react_prompt_messages(task)
 
     def _append_observation(self, observation: str) -> tuple[str, bool]:
@@ -643,7 +726,7 @@ class DeepSeekReactAgent:
 
     def next_code_block(
         self, last_execution_output: str | None
-    ) -> tuple[str, DeepSeekChatResponse, str | None, bool]:
+    ) -> tuple[str, DeepSeekChatResponse, str | None, bool, list[dict[str, Any]]]:
         observation_for_model = None
         observation_truncated = False
         if last_execution_output is not None:
@@ -651,18 +734,74 @@ class DeepSeekReactAgent:
                 last_execution_output
             )
 
+        invalid_responses: list[dict[str, Any]] = []
         response = self.client.chat(self.messages)
+        code = extract_code_format_output(response.content)
+        for retry_index in range(self.invalid_response_retries):
+            if code:
+                break
+            invalid_responses.append(
+                {
+                    "retry_index": retry_index,
+                    "model_output": response.content,
+                    "finish_reason": response.finish_reason,
+                    "usage": response.usage,
+                    "cost_estimate": (
+                        response.cost_estimate.asdict()
+                        if response.cost_estimate is not None
+                        else None
+                    ),
+                    "cumulative_cost_cny": response.cumulative_cost_cny,
+                    "request_seconds": response.request_seconds,
+                    "response_id": response.response_id,
+                    "reasoning_content": None,
+                }
+            )
+            self.messages.append(Message(role="assistant", content=response.content))
+            self.messages.append(
+                Message(
+                    role="user",
+                    content=(
+                        "Your previous response did not contain an executable fenced Python code "
+                        "block. Do not return analysis alone. Return exactly one complete "
+                        "```python ... ``` action for the current AppWorld state."
+                    ),
+                )
+            )
+            response = self.client.chat(self.messages)
+            code = extract_code_format_output(response.content)
         assistant_message = Message(
             role="assistant",
             content=response.content,
             stopped_by_max_tokens_limit=response.finish_reason == "length",
         )
         self.messages.append(assistant_message)
-        code = extract_code_format_output(response.content)
-        return code, response, observation_for_model, observation_truncated
+        return code, response, observation_for_model, observation_truncated, invalid_responses
 
     def chat_history(self) -> list[dict[str, Any]]:
         return [message_to_trajectory_dict(message) for message in self.messages]
+
+    def replay_assistant(self, model_output: str) -> None:
+        """Restore one visible assistant action while its environment action is replayed."""
+        self.messages.append(Message(role="assistant", content=model_output))
+
+
+def repair_prefix_steps(trajectory: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return steps strictly before the first critical model/environment error.
+
+    AppWorld does not expose portable snapshots through this client, so continuation is restored
+    by initializing a fresh task and replaying the exact successful action prefix. This preserves
+    a real environment state and never exposes evaluator data to the model.
+    """
+    prefix: list[dict[str, Any]] = []
+    for step in trajectory.get("steps") or []:
+        if step.get("no_code_found") or step.get("execution_failed"):
+            break
+        action = str(step.get("action_code") or "")
+        if "apis.supervisor.complete_task" in action:
+            break
+        prefix.append(step)
+    return prefix
 
 
 def trajectory_path(output_dir: Path, task_id: str) -> Path:
@@ -750,6 +889,13 @@ def save_run_config(
             "task_retries": settings.task_retries,
             "resume": settings.resume,
             "cost_limit_cny": settings.cost_limit_cny,
+            "repair_from_trajectory": (
+                str(settings.repair_from_trajectory)
+                if settings.repair_from_trajectory is not None
+                else None
+            ),
+            "persist_reasoning_content": settings.persist_reasoning_content,
+            "invalid_response_retries": settings.invalid_response_retries,
             "pricing_cny_per_1m_tokens": {
                 family: asdict(pricing) for family, pricing in PRICING_CNY_BY_MODEL_FAMILY.items()
             },
@@ -795,12 +941,57 @@ def run_single_task_once(
             task=task,
             client=client,
             max_observation_chars=settings.max_observation_chars,
+            invalid_response_retries=settings.invalid_response_retries,
         )
         initial_prompt_messages = agent.chat_history()
         last_execution_output: str | None = None
 
-        for interaction_idx in range(settings.max_interactions):
-            code, model_response, observation_for_model, observation_truncated = (
+        if settings.repair_from_trajectory is not None:
+            with open(settings.repair_from_trajectory) as f:
+                source_trajectory = json.load(f)
+            if source_trajectory.get("task_id") != task_id:
+                raise ValueError(
+                    "repair trajectory task_id does not match requested task: "
+                    f"{source_trajectory.get('task_id')} != {task_id}"
+                )
+            for replayed_step in repair_prefix_steps(source_trajectory):
+                replay_observation_sent: str | None = None
+                replay_observation_truncated = False
+                if last_execution_output is not None:
+                    replay_observation_sent, replay_observation_truncated = agent._append_observation(
+                        last_execution_output
+                    )
+                action = str(replayed_step["action_code"])
+                agent.replay_assistant(str(replayed_step["model_output"]))
+                environment_result = world.execute(action)
+                steps.append(
+                    {
+                        **replayed_step,
+                        "source": "replayed_repair_prefix",
+                        "reasoning_content": None,
+                        "usage": None,
+                        "cost_estimate": None,
+                        "request_seconds": 0.0,
+                        "response_id": None,
+                        "invalid_responses_before_action": [],
+                        "observation": last_execution_output,
+                        "observation_sent_to_model": replay_observation_sent,
+                        "observation_truncated": replay_observation_truncated,
+                        "environment_result": environment_result,
+                        "execution_failed": execution_failed(environment_result),
+                        "task_completed": world.task_completed(),
+                    }
+                )
+                last_execution_output = environment_result
+
+        for interaction_idx in range(len(steps), settings.max_interactions):
+            (
+                code,
+                model_response,
+                observation_for_model,
+                observation_truncated,
+                invalid_responses,
+            ) = (
                 agent.next_code_block(last_execution_output)
             )
             environment_result = world.execute(code)
@@ -812,7 +1003,11 @@ def run_single_task_once(
                     "observation_sent_to_model": observation_for_model,
                     "observation_truncated": observation_truncated,
                     "model_output": model_response.content,
-                    "reasoning_content": model_response.reasoning_content,
+                    "reasoning_content": (
+                        model_response.reasoning_content
+                        if settings.persist_reasoning_content
+                        else None
+                    ),
                     "finish_reason": model_response.finish_reason,
                     "usage": model_response.usage,
                     "cost_estimate": (
@@ -823,6 +1018,7 @@ def run_single_task_once(
                     "cumulative_cost_cny": model_response.cumulative_cost_cny,
                     "request_seconds": model_response.request_seconds,
                     "response_id": model_response.response_id,
+                    "invalid_responses_before_action": invalid_responses,
                     "action_code": code,
                     "no_code_found": no_code_found(code),
                     "environment_result": environment_result,
@@ -893,12 +1089,22 @@ def run_single_task_once(
         "eval_result": eval_result_to_dict(eval_result),
         "steps_count": len(steps),
         "cost_cny": sum(
-            step["cost_estimate"]["cost_cny"]
+            (
+                (step.get("cost_estimate") or {}).get("cost_cny", 0.0)
+                + sum(
+                    (record.get("cost_estimate") or {}).get("cost_cny", 0.0)
+                    for record in step.get("invalid_responses_before_action") or []
+                )
+            )
             for step in steps
-            if step.get("cost_estimate") is not None
         ),
         "cumulative_cost_cny": client.total_cost_cny,
         "cost_limit_cny": settings.cost_limit_cny,
+        "repair_from_trajectory": (
+            str(settings.repair_from_trajectory)
+            if settings.repair_from_trajectory is not None
+            else None
+        ),
         "error_type": error_type,
         "error_message": error_message,
     }
@@ -913,9 +1119,14 @@ def run_single_task_once(
         output_path=output_path,
         status=status,
         cost_cny=sum(
-            step["cost_estimate"]["cost_cny"]
+            (
+                (step.get("cost_estimate") or {}).get("cost_cny", 0.0)
+                + sum(
+                    (record.get("cost_estimate") or {}).get("cost_cny", 0.0)
+                    for record in step.get("invalid_responses_before_action") or []
+                )
+            )
             for step in steps
-            if step.get("cost_estimate") is not None
         ),
         cumulative_cost_cny=client.total_cost_cny,
     )
@@ -938,7 +1149,7 @@ def run_single_task(
         return TaskRunResult(
             task_id=task_id,
             model_profile=settings.model_profile.name,
-            success=cast(bool | None, trajectory.get("success")),
+            success=cast("bool | None", trajectory.get("success")),
             steps=int(trajectory.get("steps_count", 0)),
             error_type=str(trajectory.get("error_type", "")),
             output_path=output_path,

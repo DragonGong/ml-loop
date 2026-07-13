@@ -7,7 +7,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Self, TypedDict, cast
+from typing import Any, Self, TypeAlias, TypedDict, cast
 
 import cattrs
 import hydra.utils
@@ -31,7 +31,7 @@ from phi_agents.utils.logger import get_phi_logger
 converter = get_converter()
 logger = get_phi_logger()
 
-type TaskId = str
+TaskId: TypeAlias = str
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,7 @@ class EpisodeDict(TypedDict):
     n_execution_failed: int  # Number of turns where the code block execution failed
     n_no_code_found: int  # Number of turns where the executed code block was empty
     cancelled: bool
+    context_truncated: bool
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class Episode:
     n_execution_failed: int  # Number of turns where the code block execution failed
     n_no_code_found: int  # Number of turns where the executed code block was empty
     cancelled: bool
+    context_truncated: bool = False
 
     def asdict(self) -> EpisodeDict:
         return {
@@ -131,6 +133,7 @@ class Episode:
             "num_prompt_messages": self.num_prompt_messages,
             "n_execution_failed": self.n_execution_failed,
             "n_no_code_found": self.n_no_code_found,
+            "context_truncated": self.context_truncated,
         }
 
     def save(self, json_path: Path) -> None:
@@ -148,7 +151,7 @@ class Episode:
             task=converter.structure(json_data["task"], Task),
             chat_history=[message_from_dict(m) for m in json_data["chat_history"]],
             eval_result=cast(
-                TaskEvalResult,
+                "TaskEvalResult",
                 converter.structure(json_data["eval_result"], TaskEvalResult),
             )
             if json_data["eval_result"]
@@ -157,6 +160,7 @@ class Episode:
             n_execution_failed=json_data.get("n_execution_failed", -1),
             n_no_code_found=json_data.get("n_no_code_found", -1),
             cancelled=json_data.get("cancelled", False),
+            context_truncated=json_data.get("context_truncated", False),
         )
 
 
@@ -184,7 +188,7 @@ def load_eval_result(json_path: Path) -> ExperimentEvalResult:
     json_data["individual"] = TaskMetricsCollection(
         cattrs.structure(json_data["individual"], dict[TaskId, TaskEvalResult])
     )
-    return cast(ExperimentEvalResult, cattrs.structure(json_data, ExperimentEvalResult))
+    return cast("ExperimentEvalResult", cattrs.structure(json_data, ExperimentEvalResult))
 
 
 class RolloutCancelled(RuntimeError):
@@ -239,12 +243,13 @@ def _run_vllm_inference_single_server_single_task(
     )
     # TODO: Load lora adapter at agent construction
 
-    agent = cast(AppworldAgent, hydra.utils.instantiate(appworld_config.agent, llm=llm, task=task))
+    agent = cast("AppworldAgent", hydra.utils.instantiate(appworld_config.agent, llm=llm, task=task))
     # Get how many messages we prompt the agent with before the task begins
     num_prompt_messages = len(agent.history_as_messages("dummy message")) - 1
 
     output: str | None = None
     cancelled = False
+    context_truncated = False
     # Until the task is completed or max_interactions is reached
     logger.info(f"-------------------------- {task_id} ------------------------------")
 
@@ -258,6 +263,7 @@ def _run_vllm_inference_single_server_single_task(
         except MaxSeqLenExceeded:
             logger.warning(f"Early stopping {task_id} after {interaction + 1} interactions")
             output = "Terminating episode: exceeded max sequence length"
+            context_truncated = True
             break
         except RolloutCancelled:
             logger.warning(f"Rollout for {task_id=} cancelled after {interaction + 1} interactions")
@@ -309,6 +315,7 @@ def _run_vllm_inference_single_server_single_task(
         cancelled=cancelled,
         n_execution_failed=n_execution_failed,
         n_no_code_found=n_no_code_found,
+        context_truncated=context_truncated,
     )
 
 

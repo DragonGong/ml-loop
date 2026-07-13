@@ -242,6 +242,8 @@ def analyze(
     n_success = 0
     pass_rate_sum = 0.0
     execution_failed_count = 0
+    no_code_found_count = 0
+    context_truncated_count = 0
     invalid_api_hits = 0
     total_turns = 0
     code_chars = 0
@@ -258,6 +260,8 @@ def analyze(
     failed_api_calls = 0
     recovered_api_calls = 0
     capitulation_after_error_count = 0
+    failed_task_type_counts: Counter[str] = Counter()
+    failed_task_ids: list[str] = []
 
     for path in paths:
         episode = json.loads(path.read_text())
@@ -266,8 +270,13 @@ def analyze(
         passes = eval_result.get("passes") or []
         if eval_result.get("success"):
             n_success += 1
+        else:
+            task = episode.get("task") or {}
+            failed_task_ids.append(str(task.get("task_id") or path.parents[1].name))
         pass_rate_sum += (len(passes) / num_tests) if num_tests else 0.0
         execution_failed_count += int(episode.get("n_execution_failed") or 0)
+        no_code_found_count += int(episode.get("n_no_code_found") or 0)
+        context_truncated_count += int(episode.get("context_truncated") or 0)
 
         all_text = "\n".join(_text_values(episode.get("chat_history", [])))
         invalid_api_hits += sum(len(pattern.findall(all_text)) for pattern in invalid_patterns)
@@ -277,6 +286,15 @@ def analyze(
         dummy_words_extended += len(DUMMY_EXTENDED_RE.findall(all_text))
 
         turns = _parse_turns(episode)
+        if not eval_result.get("success"):
+            apps = {
+                app_name
+                for turn in turns
+                for app_name, _api_name in turn.api_calls
+                if app_name != "supervisor"
+            }
+            for app_name in apps or {"unknown"}:
+                failed_task_type_counts[app_name] += 1
         if not turns and eval_result.get("num_interactions") is not None:
             total_turns += int(eval_result["num_interactions"])
         else:
@@ -333,6 +351,8 @@ def analyze(
         "SGC_3": official_metrics["SGC_3"],
         "average_partial_pass_rate": _safe_avg(pass_rate_sum, n_rollouts),
         "execution_failed_count": execution_failed_count,
+        "no_code_found_count": no_code_found_count,
+        "context_truncation_ratio": _safe_avg(context_truncated_count, n_rollouts),
         "invalid_api_hits": invalid_api_hits,
         "num_rollouts_analyzed": n_rollouts,
         "num_turns_avg": _safe_avg(total_turns, n_rollouts),
@@ -352,10 +372,13 @@ def analyze(
         "failed_api_call_give_up_rate": failed_api_call_give_up_rate,
         "failed_api_calls": failed_api_calls,
         "recovered_api_calls": recovered_api_calls,
+        "error_recovery_success_rate": _safe_avg(recovered_api_calls, failed_api_calls),
         "capitulation_after_error_count": capitulation_after_error_count,
         "eval_result_path": eval_result_path,
         "eval_log_path": eval_log_path,
         "behavior_summary_path": behavior_summary_path,
+        "failed_task_ids": failed_task_ids,
+        "failed_task_type_counts": dict(failed_task_type_counts),
     }
     return row
 
