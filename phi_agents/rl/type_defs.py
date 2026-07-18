@@ -336,7 +336,9 @@ class Scenario(ABC):
 
 class ScenarioRunner(ABC):
     @abstractmethod
-    def run(self, scenario: Scenario, llm: TrainableLLM) -> TrainingRollout:
+    def run(
+        self, scenario: Scenario, llm: TrainableLLM, rollout_seed: int | None = None
+    ) -> TrainingRollout:
         """Run the scenario.
 
         Must be thread-safe.
@@ -344,6 +346,8 @@ class ScenarioRunner(ABC):
         Args:
             scenario: .
             llm: The LLM to use within the agent.
+            rollout_seed: Optional deterministic base seed for this rollout. Each
+                successive model call derives the next seed from this value.
         """
         pass
 

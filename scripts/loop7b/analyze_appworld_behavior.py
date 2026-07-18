@@ -9,7 +9,9 @@
 The failed-api recovery metric is an approximation because episode.json stores the final
 conversation, not a structured per-call execution trace. We treat AppWorld API endpoints that
 appear in code from a turn whose following observation contains "Execution failed." as failed,
-and mark them recovered if a later non-failing turn calls the same endpoint again.
+and mark them recovered if a later non-failing turn calls the same endpoint again.  The distinct
+error-rollout recovery metric is strict success among episodes containing at least one execution
+failure.
 """
 
 from __future__ import annotations
@@ -35,9 +37,7 @@ INVALID_API_PATTERNS = (
 
 CODE_BLOCK_RE = re.compile(r"```(?:python|py)\s*\n?(.*?)```", flags=re.IGNORECASE | re.DOTALL)
 PARTIAL_CODE_RE = re.compile(r"```(?:python|py)\s*\n?(.*)$", flags=re.IGNORECASE | re.DOTALL)
-API_CALL_RE = re.compile(
-    r"\bapis\.([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\("
-)
+API_CALL_RE = re.compile(r"\bapis\.([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 DOC_DESC_RE = re.compile(
     r"\bapis\.api_docs\.show_api_descriptions\s*\((?P<args>[^)]*)\)",
     flags=re.DOTALL,
@@ -54,13 +54,14 @@ ASSUMPTION_EXTENDED_RE = re.compile(
     flags=re.IGNORECASE,
 )
 DUMMY_RE = re.compile(r"\bdummy\b", flags=re.IGNORECASE)
-DUMMY_EXTENDED_RE = re.compile(
-    r"\b(?:dummy|placeholder|fake|example)\b", flags=re.IGNORECASE
-)
+DUMMY_EXTENDED_RE = re.compile(r"\b(?:dummy|placeholder|fake|example)\b", flags=re.IGNORECASE)
 CAPITULATION_RE = re.compile(
     r"\b(?:cannot|can't|unable|give up)\b|instead assume|let'?s assume|dummy",
     flags=re.IGNORECASE,
 )
+HTTP_401_RE = re.compile(r"(?<!\d)401(?!\d)")
+HTTP_422_RE = re.compile(r"(?<!\d)422(?!\d)")
+NAME_ERROR_RE = re.compile(r"\bNameError\b", flags=re.IGNORECASE)
 EXECUTION_FAILED_TEXT = "Execution failed."
 METRIC_KEYS = ("TGC", "SGC", "TGC_1", "TGC_2", "TGC_3", "SGC_1", "SGC_2", "SGC_3")
 
@@ -123,6 +124,24 @@ def _api_calls(code: str) -> list[tuple[str, str]]:
             continue
         calls.append((app_name, api_name))
     return calls
+
+
+def _turn_action_text(turn: Turn) -> str:
+    if turn.code_blocks:
+        return "\n".join(turn.code_blocks)
+    return turn.assistant_text
+
+
+def _normalized_turn_action(turn: Turn) -> str:
+    return " ".join(_turn_action_text(turn).split())
+
+
+def _episode_execution_failure_count(episode: dict[str, Any], turns: list[Turn]) -> int:
+    """Prefer AppWorld's episode counter and fall back to parsed observations."""
+    value = episode.get("n_execution_failed")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return sum(turn.execution_failed for turn in turns)
 
 
 def _doc_before_api_call_counts(code_blocks: list[str]) -> tuple[int, int]:
@@ -259,6 +278,13 @@ def analyze(
     dummy_words_extended = 0
     failed_api_calls = 0
     recovered_api_calls = 0
+    http_401_count = 0
+    http_422_count = 0
+    name_error_count = 0
+    consecutive_repeated_failed_action_count = 0
+    execution_errors_before_strict_success = 0
+    error_rollout_count = 0
+    error_rollout_strict_success_count = 0
     capitulation_after_error_count = 0
     failed_task_type_counts: Counter[str] = Counter()
     failed_task_ids: list[str] = []
@@ -274,7 +300,6 @@ def analyze(
             task = episode.get("task") or {}
             failed_task_ids.append(str(task.get("task_id") or path.parents[1].name))
         pass_rate_sum += (len(passes) / num_tests) if num_tests else 0.0
-        execution_failed_count += int(episode.get("n_execution_failed") or 0)
         no_code_found_count += int(episode.get("n_no_code_found") or 0)
         context_truncated_count += int(episode.get("context_truncated") or 0)
 
@@ -286,6 +311,19 @@ def analyze(
         dummy_words_extended += len(DUMMY_EXTENDED_RE.findall(all_text))
 
         turns = _parse_turns(episode)
+        episode_execution_failures = _episode_execution_failure_count(episode, turns)
+        execution_failed_count += episode_execution_failures
+        if eval_result.get("success"):
+            execution_errors_before_strict_success += episode_execution_failures
+        if episode_execution_failures > 0:
+            error_rollout_count += 1
+            if eval_result.get("success"):
+                error_rollout_strict_success_count += 1
+
+        observations = "\n".join(turn.observation_text for turn in turns)
+        http_401_count += len(HTTP_401_RE.findall(observations))
+        http_422_count += len(HTTP_422_RE.findall(observations))
+        name_error_count += len(NAME_ERROR_RE.findall(observations))
         if not eval_result.get("success"):
             apps = {
                 app_name
@@ -301,16 +339,22 @@ def analyze(
             total_turns += len(turns)
 
         pending_failed: Counter[tuple[str, str]] = Counter()
+        previous_failed_action: str | None = None
         for idx, turn in enumerate(turns):
             code_chars += sum(len(block) for block in turn.code_blocks)
             if len(turn.code_blocks) > 1:
                 multiple_code_cell_turns += 1
             if turn.execution_failed:
                 execution_error_turns += 1
+                normalized_action = _normalized_turn_action(turn)
+                if normalized_action and normalized_action == previous_failed_action:
+                    consecutive_repeated_failed_action_count += 1
+                previous_failed_action = normalized_action
                 for endpoint in set(turn.api_calls):
                     failed_api_calls += 1
                     pending_failed[endpoint] += 1
             else:
+                previous_failed_action = None
                 for endpoint in set(turn.api_calls):
                     if pending_failed[endpoint] > 0:
                         recovered_api_calls += pending_failed[endpoint]
@@ -332,9 +376,7 @@ def analyze(
 
     n_rollouts = len(paths)
     failed_api_call_give_up_rate = (
-        (failed_api_calls - recovered_api_calls) / failed_api_calls
-        if failed_api_calls
-        else 0.0
+        (failed_api_calls - recovered_api_calls) / failed_api_calls if failed_api_calls else 0.0
     )
 
     row: dict[str, Any] = {
@@ -351,6 +393,18 @@ def analyze(
         "SGC_3": official_metrics["SGC_3"],
         "average_partial_pass_rate": _safe_avg(pass_rate_sum, n_rollouts),
         "execution_failed_count": execution_failed_count,
+        "http_401_count": http_401_count,
+        "http_422_count": http_422_count,
+        "name_error_count": name_error_count,
+        "consecutive_repeated_failed_action_count": (consecutive_repeated_failed_action_count),
+        "average_execution_errors_before_strict_success": _safe_avg(
+            execution_errors_before_strict_success, n_success
+        ),
+        "error_rollout_count": error_rollout_count,
+        "error_rollout_strict_success_count": error_rollout_strict_success_count,
+        "error_rollout_recovery_success_rate": _safe_avg(
+            error_rollout_strict_success_count, error_rollout_count
+        ),
         "no_code_found_count": no_code_found_count,
         "context_truncation_ratio": _safe_avg(context_truncated_count, n_rollouts),
         "invalid_api_hits": invalid_api_hits,

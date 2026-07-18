@@ -13,6 +13,12 @@ experiment_name: appworld_inference
 eval_seed: 0
 
 num_scenario_runners: 64
+rollouts_per_scenario: 1
+rollout_seeds: null
+num_scenarios: null
+diagnostic_output_dir: null
+diagnostic_iteration: 0
+start_port: 5555
 
 scenario_runner:
   _target_: phi_agents.rl.appworld_scenario_runner.AppWorldScenarioRunner

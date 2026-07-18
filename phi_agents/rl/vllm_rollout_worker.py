@@ -51,7 +51,7 @@ logger = get_phi_logger()
 ScenarioIdx = int
 ScenariosAndRollouts = tuple[list[Scenario], list[list[TrainingRollout]]]
 
-RolloutGenerationTask = tuple[ScenarioIdx, Scenario, int, Any, int, int]
+RolloutGenerationTask = tuple[ScenarioIdx, Scenario, int, Any, int | None, int, int]
 
 
 class VLLMRolloutWorker:
@@ -70,11 +70,20 @@ class VLLMRolloutWorker:
         max_gpu_mem_utilization: float | None,
         start_port: int = START_PORT,
         num_runners: int | None = None,
+        rollout_seeds: list[int] | None = None,
     ):
         if not ray.is_initialized():
             connect_ray_cluster(rank, barrier)
         self._scenario_sampler = scenario_sampler
         self._rollouts_per_scenario = rollouts_per_scenario
+        if rollout_seeds is not None and len(rollout_seeds) != rollouts_per_scenario:
+            raise ValueError(
+                "rollout_seeds must contain exactly one seed per rollout index: "
+                f"got {len(rollout_seeds)} seeds for {rollouts_per_scenario} rollouts"
+            )
+        self._rollout_seeds = (
+            None if rollout_seeds is None else [int(seed) for seed in rollout_seeds]
+        )
         self._vllm_server_cfg = llm_cfg.vllm_server
         self._llm_cfg = llm_cfg
         self._runner_cfg = runner_cfg
@@ -286,16 +295,23 @@ class VLLMRolloutWorker:
             )
 
         # mapping from rollout generation tasks to:
-        # (scenario_idx, scenario, rollout_idx, llm, retry_count, runner_idx)
+        # (scenario_idx, scenario, rollout_idx, llm, rollout_seed, retry_count, runner_idx)
         futures: dict[Future[TrainingRollout], RolloutGenerationTask] = {}
 
-        task_queue: Queue[tuple[ScenarioIdx, Scenario, int, TrainableLLM]] = Queue()
+        task_queue: Queue[
+            tuple[ScenarioIdx, Scenario, int, TrainableLLM, int | None]
+        ] = Queue()
         n_tasks = 0
         scenarios = [next(self._scenario_sampler) for _ in range(n_scenarios)]
         for rollout_idx in range(self._rollouts_per_scenario):
             for sc_idx, scenario in enumerate(scenarios):
                 llm = llms[(n_tasks + self._local_rank) % len(llms)]
-                task_queue.put((sc_idx, scenario, rollout_idx, llm))
+                rollout_seed = (
+                    None
+                    if self._rollout_seeds is None
+                    else self._rollout_seeds[rollout_idx]
+                )
+                task_queue.put((sc_idx, scenario, rollout_idx, llm, rollout_seed))
                 n_tasks += 1
         soft_dead_count = 0
 
@@ -307,16 +323,37 @@ class VLLMRolloutWorker:
                 scenario: Scenario,
                 rollout_idx: int,
                 llm: TrainableLLM,
+                rollout_seed: int | None,
                 retry_count: int,
             ) -> None:
-                future = executor.submit(self._scenario_runners[runner_idx_].run, scenario, llm)
-                futures[future] = (sc_idx, scenario, rollout_idx, llm, retry_count, runner_idx_)
+                if rollout_seed is None:
+                    future = executor.submit(
+                        self._scenario_runners[runner_idx_].run, scenario, llm
+                    )
+                else:
+                    future = executor.submit(
+                        self._scenario_runners[runner_idx_].run,
+                        scenario,
+                        llm,
+                        rollout_seed,
+                    )
+                futures[future] = (
+                    sc_idx,
+                    scenario,
+                    rollout_idx,
+                    llm,
+                    rollout_seed,
+                    retry_count,
+                    runner_idx_,
+                )
 
             def _maybe_submit_task(runner_idx_: int) -> bool:
                 try:
                     next_task = task_queue.get_nowait()
-                    sc_idx, scenario, rollout_idx, llm = next_task
-                    _submit_task(runner_idx_, sc_idx, scenario, rollout_idx, llm, 0)
+                    sc_idx, scenario, rollout_idx, llm, rollout_seed = next_task
+                    _submit_task(
+                        runner_idx_, sc_idx, scenario, rollout_idx, llm, rollout_seed, 0
+                    )
                     return True
                 except Empty:
                     return False
@@ -334,6 +371,7 @@ class VLLMRolloutWorker:
                     this_scenario,
                     this_rollout_idx,
                     this_llm,
+                    this_rollout_seed,
                     retry_count,
                     this_runner_idx,
                 ) = futures.pop(completed_future)
@@ -361,18 +399,23 @@ class VLLMRolloutWorker:
                                 this_scenario,
                                 this_rollout_idx,
                                 this_llm,
+                                this_rollout_seed,
                                 retry_count + 1,
                             )
                             continue
-                        setattr(exc, "soft_dead_count", soft_dead_count)
-                        setattr(exc, "max_soft_dead_per_iteration", self._max_soft_dead_per_iteration)
-                        setattr(exc, "max_rollout_retries", self._max_soft_dead_rollout_retries)
+                        exc.__dict__.update(
+                            soft_dead_count=soft_dead_count,
+                            max_soft_dead_per_iteration=self._max_soft_dead_per_iteration,
+                            max_rollout_retries=self._max_soft_dead_rollout_retries,
+                        )
                         logger.error(
                             "AppWorld soft-dead retry limit exceeded; aborting iteration. "
                             f"{this_sc_idx=} {this_rollout_idx=} {retry_count=} "
                             f"{soft_dead_count=}"
                         )
                     raise
+                rollout.rollout_idx = this_rollout_idx
+                rollout.generation_seed = this_rollout_seed
                 yield this_scenario, this_sc_idx, rollout
 
                 # scenario runner `runner_idx` is now free, submit more tasks if we have any
@@ -505,8 +548,10 @@ class VLLMRolloutWorker:
                 msg = self._queue.get(block=True, timeout=1.0)
                 if isinstance(msg, Exception):
                     exception = msg
-                    setattr(exception, "finished_rollouts", n_rollouts_collected)
-                    setattr(exception, "expected_rollouts", n_rollouts_total)
+                    exception.__dict__.update(
+                        finished_rollouts=n_rollouts_collected,
+                        expected_rollouts=n_rollouts_total,
+                    )
                     logger.warning(f"rank{self._local_rank}: {exception=}")
                     # if we do not propagate an exception like this, the main thread will hang
                     # forever waiting for more items from the queue

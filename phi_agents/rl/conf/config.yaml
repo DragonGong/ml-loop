@@ -20,6 +20,10 @@ rl:
   iteration_manifest:
     enabled: True
 
+  rollout_diagnostics:
+    enabled: False
+    save_trajectories: True
+
   inference_requires_memory_gb: null
   learning_requires_memory_gb: null
 

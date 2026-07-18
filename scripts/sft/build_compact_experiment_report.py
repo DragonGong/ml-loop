@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,22 @@ def _epoch_eval_loss(run_dir: Path, checkpoint: int) -> float | None:
     return matches[-1] if matches else None
 
 
+def _checkpoint_final_learning_rate(run_dir: Path, checkpoint: int | None) -> float | None:
+    if checkpoint is None:
+        return None
+    scheduler_path = run_dir / f"checkpoint-{checkpoint}" / "scheduler.pt"
+    if not scheduler_path.is_file():
+        return None
+    try:
+        import torch
+
+        state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    last_lrs = state.get("_last_lr") or []
+    return float(last_lrs[0]) if last_lrs else None
+
+
 def _run_rows(root: Path) -> list[dict[str, Any]]:
     rows = []
     for metrics_path in sorted((root / "runs").glob("*/train_metrics.json")):
@@ -29,6 +46,13 @@ def _run_rows(root: Path) -> list[dict[str, Any]]:
         metrics = _load(metrics_path)
         artifact = _load(run_dir / "sft_artifact.json")
         config = artifact.get("sft_config") or {}
+        optimizer_steps = metrics.get("optimizer_steps")
+        scheduler_total_steps = metrics.get("scheduler_total_steps") or optimizer_steps
+        warmup_steps = metrics.get("warmup_steps")
+        if warmup_steps is None and scheduler_total_steps is not None:
+            warmup_steps = math.ceil(
+                float(scheduler_total_steps) * float(config.get("warmup_ratio") or 0.0)
+            )
         epoch_steps = []
         for epoch in (1, 2):
             link = run_dir / f"epoch-{epoch}"
@@ -53,9 +77,18 @@ def _run_rows(root: Path) -> list[dict[str, Any]]:
                 "train_windows": metrics.get("train_windows"),
                 "validation_windows": metrics.get("validation_windows"),
                 "supervised_tokens": metrics.get("effective_supervised_token_exposures"),
-                "optimizer_steps": metrics.get("optimizer_steps"),
+                "optimizer_steps": optimizer_steps,
                 "train_loss": metrics.get("train_loss"),
                 "validation_loss": metrics.get("eval_loss"),
+                "final_learning_rate": (
+                    metrics.get("final_learning_rate")
+                    if metrics.get("final_learning_rate") is not None
+                    else _checkpoint_final_learning_rate(run_dir, optimizer_steps)
+                ),
+                "expected_optimizer_steps": metrics.get("expected_optimizer_steps")
+                or optimizer_steps,
+                "warmup_steps": warmup_steps,
+                "scheduler_total_steps": scheduler_total_steps,
                 "epoch_1_validation_loss": (
                     _epoch_eval_loss(run_dir, epoch_steps[0])
                     if epoch_steps[0] is not None
@@ -86,6 +119,55 @@ def _run_rows(root: Path) -> list[dict[str, Any]]:
                 **epoch_checkpoints,
             }
         )
+    return rows
+
+
+def _single_epoch_comparison_rows(
+    evaluation_rows: list[dict[str, Any]], training_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    split = "sft_d12_validation_20260713"
+    evaluations = {(row.get("split"), row.get("name")): row for row in evaluation_rows}
+    training = {row.get("name"): row for row in training_rows}
+    rows = []
+    for group, repeated_name, independent_name in (
+        ("A_approximately_200k", "d12_25", "d12_50_1epoch"),
+        ("B_approximately_410k", "d12_50", "d12_100_1epoch"),
+    ):
+        for variant, name in (
+            ("repeat_less_data", repeated_name),
+            ("more_independent_data", independent_name),
+        ):
+            evaluation = evaluations.get((split, name))
+            train = training.get(name)
+            if not evaluation or not train:
+                continue
+            rows.append(
+                {
+                    "record_type": "single_epoch_comparison",
+                    "comparison_group": group,
+                    "comparison_variant": variant,
+                    "name": name,
+                    "new_experiment": name.endswith("_1epoch"),
+                    "TGC": evaluation.get("TGC"),
+                    "partial_pass": evaluation.get("partial_pass"),
+                    "execution_failed": evaluation.get("execution_failed"),
+                    "no_code": evaluation.get("no_code"),
+                    "invalid_api": evaluation.get("invalid_api"),
+                    "api_doc_calls_per_rollout": evaluation.get("api_doc_calls_per_rollout"),
+                    "context_truncation_ratio": evaluation.get("context_truncation_ratio"),
+                    "average_turns": evaluation.get("average_turns"),
+                    "train_loss": train.get("train_loss"),
+                    "validation_loss": train.get("validation_loss"),
+                    "supervised_tokens": train.get("supervised_tokens"),
+                    "optimizer_steps": train.get("optimizer_steps"),
+                    "expected_optimizer_steps": train.get("expected_optimizer_steps"),
+                    "warmup_steps": train.get("warmup_steps"),
+                    "scheduler_total_steps": train.get("scheduler_total_steps"),
+                    "final_learning_rate": train.get("final_learning_rate"),
+                    "runtime_seconds": train.get("runtime_seconds"),
+                    "peak_gpu_memory_bytes": train.get("peak_gpu_memory_bytes"),
+                }
+            )
     return rows
 
 
@@ -340,6 +422,27 @@ def _markdown(rows: list[dict[str, Any]], decisions: dict[str, Any]) -> str:
                 }
             )
         )
+    comparison = [row for row in rows if row["record_type"] == "single_epoch_comparison"]
+    if comparison:
+        lines.extend(
+            [
+                "",
+                "## Added one-epoch exposure-matched controls",
+                "",
+                "| group | variant | run | TGC | partial | execution failed | no-code | invalid API | docs/rollout | truncation | turns | train loss | validation loss | supervised exposure | steps | warmup | scheduler steps | final LR | seconds | peak bytes |",
+                "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in comparison:
+            lines.append(
+                "| {comparison_group} | {comparison_variant} | {name} | {TGC} | "
+                "{partial_pass} | {execution_failed} | {no_code} | {invalid_api} | "
+                "{api_doc_calls_per_rollout} | {context_truncation_ratio} | "
+                "{average_turns} | {train_loss} | {validation_loss} | "
+                "{supervised_tokens} | {optimizer_steps} | {warmup_steps} | "
+                "{scheduler_total_steps} | {final_learning_rate} | "
+                "{runtime_seconds} | {peak_gpu_memory_bytes} |".format(**row)
+            )
     lines.extend(
         [
             "",
@@ -360,12 +463,21 @@ def _markdown(rows: list[dict[str, Any]], decisions: dict[str, Any]) -> str:
 
 def build(root: Path, output_dir: Path) -> dict[str, Any]:
     evaluation_rows = _evaluation_rows(root)
+    training_rows = _run_rows(root)
+    single_epoch_rows = _single_epoch_comparison_rows(evaluation_rows, training_rows)
     decision_rows, decisions = _decision_rows(root, evaluation_rows)
-    rows = [*_data_rows(root), *_run_rows(root), *evaluation_rows, *decision_rows]
+    rows = [
+        *_data_rows(root),
+        *training_rows,
+        *evaluation_rows,
+        *single_epoch_rows,
+        *decision_rows,
+    ]
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "experiment_root": str(root.resolve()),
         "decisions": decisions,
+        "single_epoch_comparisons": single_epoch_rows,
         "rows": rows,
     }
     output_dir.mkdir(parents=True, exist_ok=True)

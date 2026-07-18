@@ -1,0 +1,6 @@
+_target_: phi_agents.rl.appworld_scenario_runner.ManifestAppWorldScenarioSampler
+manifest_path: ???
+dataset_name: train_difficulty_1_2
+start_iteration: 1
+cycle: true
+max_parallel: 1

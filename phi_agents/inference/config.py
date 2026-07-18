@@ -61,6 +61,12 @@ class MainInferenceConfig:
     scenario_sampler: Any
     scenario_runner: Any
     num_scenario_runners: int
+    rollouts_per_scenario: int = 1
+    rollout_seeds: list[int] | None = None
+    num_scenarios: int | None = None
+    diagnostic_output_dir: str | None = None
+    diagnostic_iteration: int = 0
+    start_port: int = 5555
     hydra: Any = MISSING
     log_dir: str = "logs/default"
     wandb_project: str = "default_project"

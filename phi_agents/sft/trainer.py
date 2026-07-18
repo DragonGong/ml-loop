@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import shutil
 import signal
@@ -68,6 +69,30 @@ class SFTConfig:
     max_train_samples: int | None = None
     max_validation_samples: int | None = None
     use_cpu: bool = False
+
+
+def training_schedule_preflight(config: SFTConfig, train_windows: int) -> dict[str, int | float]:
+    if train_windows < 1:
+        raise ValueError("At least one training window is required")
+    micro_batches_per_epoch = math.ceil(train_windows / config.per_device_train_batch_size)
+    optimizer_steps_per_epoch = math.ceil(
+        micro_batches_per_epoch / config.gradient_accumulation_steps
+    )
+    scheduler_total_steps = (
+        config.max_steps
+        if config.max_steps > 0
+        else math.ceil(optimizer_steps_per_epoch * config.epochs)
+    )
+    warmup_steps = math.ceil(scheduler_total_steps * config.warmup_ratio)
+    return {
+        "train_windows": train_windows,
+        "epochs": config.epochs,
+        "micro_batches_per_epoch": micro_batches_per_epoch,
+        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+        "expected_optimizer_steps": scheduler_total_steps,
+        "warmup_steps": warmup_steps,
+        "scheduler_total_steps": scheduler_total_steps,
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -666,6 +691,9 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     train_rows, validation_rows, stats = prepare_windows(config, tokenizer)
+    schedule = training_schedule_preflight(config, len(train_rows))
+    schedule["effective_supervised_tokens_per_epoch"] = stats["assistant_tokens"]
+    schedule["expected_supervised_token_exposures"] = int(stats["assistant_tokens"] * config.epochs)
     selected_attention_backend = _attention_backend(config)
     manifest = {
         "sft_config": {
@@ -684,6 +712,7 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         "packing": False,
         "lora_target_modules": LORA_TARGET_MODULES,
         "loop_compatible": True,
+        "schedule_preflight": schedule,
     }
     (config.output_dir / "sft_artifact.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -696,6 +725,18 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         stats["assistant_tokens"],
         stats["legacy_samples_without_step_metadata"],
         extra={"event": "training_data_audited"},
+    )
+    print("SFT_SCHEDULE_PREFLIGHT " + json.dumps(schedule, sort_keys=True), flush=True)
+    logger.info(
+        "AppWorld SFT schedule confirmed "
+        "(train_windows=%s, optimizer_steps=%s, supervised_tokens=%s, warmup_steps=%s, "
+        "scheduler_total_steps=%s)",
+        schedule["train_windows"],
+        schedule["expected_optimizer_steps"],
+        schedule["expected_supervised_token_exposures"],
+        schedule["warmup_steps"],
+        schedule["scheduler_total_steps"],
+        extra={"event": "training_schedule_confirmed"},
     )
     if tokenize_only:
         return manifest
@@ -791,10 +832,13 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         torch.cuda.reset_peak_memory_stats()
     logger.info(
         "AppWorld LoRA SFT started "
-        "(train_windows=%s, epochs=%s, accumulation=%s, attention_backend=%s)",
+        "(train_windows=%s, epochs=%s, accumulation=%s, optimizer_steps=%s, "
+        "warmup_steps=%s, attention_backend=%s)",
         len(train_rows),
         config.epochs,
         config.gradient_accumulation_steps,
+        schedule["expected_optimizer_steps"],
+        schedule["warmup_steps"],
         selected_attention_backend,
         extra={"event": "training_started"},
     )
@@ -816,6 +860,14 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
     runtime = float(result.metrics.get("train_runtime") or 0.0)
     completed_epochs = float(trainer.state.epoch or 0.0)
     metrics["optimizer_steps"] = trainer.state.global_step
+    if (
+        config.resume_from_checkpoint is None
+        and metrics["optimizer_steps"] != schedule["expected_optimizer_steps"]
+    ):
+        raise RuntimeError(
+            "Optimizer-step count did not match the preflight schedule: "
+            f"actual={metrics['optimizer_steps']} expected={schedule['expected_optimizer_steps']}"
+        )
     metrics["completed_epochs"] = completed_epochs
     metrics["effective_supervised_tokens_per_epoch"] = stats["assistant_tokens"]
     metrics["effective_supervised_token_exposures"] = int(
@@ -825,6 +877,11 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         torch.cuda.max_memory_allocated() if torch.cuda.is_available() and not config.use_cpu else 0
     )
     metrics["attention_backend"] = selected_attention_backend
+    metrics["expected_optimizer_steps"] = schedule["expected_optimizer_steps"]
+    metrics["optimizer_steps_per_epoch"] = schedule["optimizer_steps_per_epoch"]
+    metrics["warmup_steps"] = schedule["warmup_steps"]
+    metrics["scheduler_total_steps"] = schedule["scheduler_total_steps"]
+    metrics["final_learning_rate"] = float(trainer.lr_scheduler.get_last_lr()[0])
     metrics["train_tokens_per_second"] = (
         stats["total_tokens"] * completed_epochs / runtime if runtime else 0.0
     )

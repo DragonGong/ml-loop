@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import cattrs
@@ -22,6 +24,7 @@ from phi_agents.appworld.interface import AppWorldInterface, load_task_ids
 from phi_agents.evals.appworld_evals import run_vllm_inference_single_server_single_task
 from phi_agents.evals.appworld_rollout_data import AppWorldRolloutData, AppWorldTrainingRollout
 from phi_agents.inference.config import AppWorldConfig
+from phi_agents.rl.llm import SeededTrainableLLM
 from phi_agents.rl.type_defs import (
     PolicyMessage,
     PolicyTokenInfo,
@@ -65,15 +68,11 @@ class AppWorldServerHealthConfig:
                 f"{self.soft_dead_rss_gb=}, {self.hard_dead_rss_gb=}"
             )
         if not (0 < self.host_memory_hard_dead_percent <= 100):
-            raise ValueError(
-                f"{self.host_memory_hard_dead_percent=} must be in (0, 100]"
-            )
+            raise ValueError(f"{self.host_memory_hard_dead_percent=} must be in (0, 100]")
         if self.max_rollout_retries < 0:
             raise ValueError(f"{self.max_rollout_retries=} must be non-negative")
         if self.max_soft_dead_per_iteration < 0:
-            raise ValueError(
-                f"{self.max_soft_dead_per_iteration=} must be non-negative"
-            )
+            raise ValueError(f"{self.max_soft_dead_per_iteration=} must be non-negative")
         if self.check_interval_seconds <= 0:
             raise ValueError(f"{self.check_interval_seconds=} must be positive")
 
@@ -191,6 +190,133 @@ class AppWorldScenarioSampler(Iterator[AppWorldScenario]):
             self.task_ids = copy.copy(self.all_task_ids)
             self.rng.shuffle(self.task_ids)
         task_id = str(self.task_ids.pop())
+        return AppWorldScenario(task_id=task_id, dataset_name=self.dataset_name)
+
+
+class ManifestAppWorldScenarioSampler(Iterator[AppWorldScenario]):
+    """Replay exact per-iteration AppWorld scenario batches from a JSON manifest.
+
+    ``start_iteration`` makes checkpoint recovery explicit: a run resumed from
+    ``checkpoint-N`` starts with manifest iteration ``N + 1``.  The sampler is
+    deliberately single-threaded because independent prefetch workers would
+    each replay the manifest from the beginning and duplicate scenarios.
+    """
+
+    _SCHEMA_VERSION = 1
+    _MANIFEST_KIND = "appworld_loop_scenario_manifest"
+
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        dataset_name: str | None = None,
+        start_iteration: int = 1,
+        cycle: bool = True,
+        max_parallel: int = 1,
+    ):
+        if isinstance(start_iteration, bool) or int(start_iteration) != start_iteration:
+            raise ValueError("start_iteration must be an integer")
+        if max_parallel != 1:
+            raise ValueError(
+                "ManifestAppWorldScenarioSampler requires max_parallel=1 to preserve order"
+            )
+
+        self.manifest_path = Path(manifest_path).expanduser().resolve()
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        self._task_batches, manifest_dataset = self._validate_manifest(manifest)
+
+        if dataset_name is not None and dataset_name != manifest_dataset:
+            raise ValueError(
+                f"Configured dataset_name={dataset_name!r} does not match manifest "
+                f"dataset_name={manifest_dataset!r}"
+            )
+        self.dataset_name = manifest_dataset
+        self.start_iteration = int(start_iteration)
+        if not 1 <= self.start_iteration <= len(self._task_batches):
+            raise ValueError(
+                f"start_iteration must be in [1, {len(self._task_batches)}], "
+                f"got {self.start_iteration}"
+            )
+
+        self.cycle = bool(cycle)
+        self.max_parallel = max_parallel
+        self._iteration_index = self.start_iteration - 1
+        self._scenario_index = 0
+        self._exhausted = False
+
+    @classmethod
+    def _validate_manifest(cls, manifest: Any) -> tuple[list[list[str]], str]:
+        if not isinstance(manifest, dict):
+            raise ValueError("Scenario manifest must be a JSON object")
+        if manifest.get("schema_version") != cls._SCHEMA_VERSION:
+            raise ValueError("Unsupported scenario manifest schema_version")
+        if manifest.get("kind") != cls._MANIFEST_KIND:
+            raise ValueError("Unexpected scenario manifest kind")
+
+        dataset_name = manifest.get("dataset_name")
+        num_iterations = manifest.get("num_iterations")
+        scenarios_per_iteration = manifest.get("scenarios_per_iteration")
+        rollouts_per_scenario = manifest.get("rollouts_per_scenario")
+        if not isinstance(dataset_name, str) or not dataset_name:
+            raise ValueError("Manifest dataset_name must be a non-empty string")
+        counts = (num_iterations, scenarios_per_iteration, rollouts_per_scenario)
+        if not all(isinstance(value, int) and value > 0 for value in counts):
+            raise ValueError("Manifest counts must be positive integers")
+
+        iterations = manifest.get("iterations")
+        if not isinstance(iterations, list) or len(iterations) != num_iterations:
+            raise ValueError("Manifest iteration count is inconsistent")
+
+        task_batches: list[list[str]] = []
+        expected_rollouts = scenarios_per_iteration * rollouts_per_scenario
+        for expected_iteration, item in enumerate(iterations, start=1):
+            if not isinstance(item, dict) or item.get("iteration") != expected_iteration:
+                raise ValueError("Manifest iterations must be contiguous and one-based")
+            if item.get("observed_rollouts") != expected_rollouts:
+                raise ValueError("Manifest observed_rollouts is inconsistent")
+            scenarios = item.get("scenarios")
+            if not isinstance(scenarios, list) or len(scenarios) != scenarios_per_iteration:
+                raise ValueError("Manifest scenario count is inconsistent")
+
+            task_ids: list[str] = []
+            for expected_idx, scenario in enumerate(scenarios):
+                if not isinstance(scenario, dict) or scenario.get("scenario_idx") != expected_idx:
+                    raise ValueError("Manifest scenario indices must be contiguous")
+                task_id = scenario.get("task_id")
+                if not isinstance(task_id, str) or not task_id:
+                    raise ValueError("Manifest task IDs must be non-empty strings")
+                task_ids.append(task_id)
+            if len(task_ids) != len(set(task_ids)):
+                raise ValueError("Manifest iteration contains duplicate task IDs")
+            task_batches.append(task_ids)
+
+        return task_batches, dataset_name
+
+    @property
+    def next_iteration(self) -> int | None:
+        """One-based manifest iteration that the next scenario belongs to."""
+        if self._exhausted:
+            return None
+        return self._iteration_index + 1
+
+    def __iter__(self) -> Iterator[AppWorldScenario]:
+        return self
+
+    def __next__(self) -> AppWorldScenario:
+        if self._exhausted:
+            raise StopIteration
+
+        task_id = self._task_batches[self._iteration_index][self._scenario_index]
+        self._scenario_index += 1
+        if self._scenario_index == len(self._task_batches[self._iteration_index]):
+            self._scenario_index = 0
+            self._iteration_index += 1
+            if self._iteration_index == len(self._task_batches):
+                if self.cycle:
+                    self._iteration_index = 0
+                else:
+                    self._iteration_index -= 1
+                    self._exhausted = True
+
         return AppWorldScenario(task_id=task_id, dataset_name=self.dataset_name)
 
 
@@ -345,7 +471,11 @@ class AppWorldScenarioRunner(ScenarioRunner):
 
     def _start_dead_monitor(
         self, task_id: str, stop_event: threading.Event
-    ) -> tuple[threading.Thread | None, list[AppWorldServerHealthSnapshot], list[AppWorldServerHealthSnapshot]]:
+    ) -> tuple[
+        threading.Thread | None,
+        list[AppWorldServerHealthSnapshot],
+        list[AppWorldServerHealthSnapshot],
+    ]:
         soft_dead_snapshots: list[AppWorldServerHealthSnapshot] = []
         hard_dead_snapshots: list[AppWorldServerHealthSnapshot] = []
         if not self.server_health.enabled:
@@ -386,9 +516,12 @@ class AppWorldScenarioRunner(ScenarioRunner):
         thread.start()
         return thread, soft_dead_snapshots, hard_dead_snapshots
 
-    def run(self, scenario: Scenario, llm: TrainableLLM) -> TrainingRollout:
+    def run(
+        self, scenario: Scenario, llm: TrainableLLM, rollout_seed: int | None = None
+    ) -> TrainingRollout:
         assert isinstance(scenario, AppWorldScenario)
         task_id = scenario.task_id
+        rollout_llm = SeededTrainableLLM(llm, rollout_seed) if rollout_seed is not None else llm
 
         self.world.ensure_server()
         assert self.world.server is not None
@@ -405,8 +538,8 @@ class AppWorldScenarioRunner(ScenarioRunner):
             logger.info(f"Generating episode; experiment_name={experiment_name}, task_id={task_id}")
             start = time.perf_counter()
             monitor_stop_event = threading.Event()
-            monitor_thread, soft_dead_snapshots, hard_dead_snapshots = (
-                self._start_dead_monitor(task_id, monitor_stop_event)
+            monitor_thread, soft_dead_snapshots, hard_dead_snapshots = self._start_dead_monitor(
+                task_id, monitor_stop_event
             )
             try:
                 episode = run_vllm_inference_single_server_single_task(
@@ -414,7 +547,7 @@ class AppWorldScenarioRunner(ScenarioRunner):
                     task_id=task_id,
                     experiment_name=experiment_name,
                     appworld_config=self.appworld_config,
-                    llm=llm,
+                    llm=rollout_llm,
                     with_evaluation=True,
                 )
             except Exception as exc:
@@ -470,7 +603,7 @@ class AppWorldScenarioRunner(ScenarioRunner):
             ret,
             elapsed,
             episode.cancelled,
-            PolicyTokenInfo() if episode.cancelled else llm.get_policy_token_info(messages),
+            PolicyTokenInfo() if episode.cancelled else rollout_llm.get_policy_token_info(messages),
             appworld_rollout_data=appworld_rollout_data,
         )
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?Usage: $0 d12_25|d12_50|d12_100|d3 <initial-adapter-for-d3>}"
+STAGE="${1:?Usage: $0 d12_25|d12_50|d12_100|d12_50_1epoch|d12_100_1epoch|d3 <initial-adapter-for-d3>}"
 ROOT="${COMPACT_SFT_ROOT:-artifacts/appworld_sft/compact_lora_20260713}"
 MODEL_PATH="${QWEN25_7B_PATH:-.model_cache/Qwen/Qwen2.5-7B-Instruct}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -34,6 +34,24 @@ case "$STAGE" in
       --output-dir "$run_dir"
       --learning-rate 5e-5
       --epochs 2
+      --gradient-accumulation-steps 8
+      --warmup-ratio 0.05
+    )
+    ;;
+  d12_50_1epoch|d12_100_1epoch)
+    source_stage="${STAGE%_1epoch}"
+    data_dir="$ROOT/data/d12_nested/$source_stage"
+    run_dir="$ROOT/runs/$STAGE"
+    if [[ -e "$run_dir" ]]; then
+      echo "Refusing to overwrite an existing one-epoch run: $run_dir" >&2
+      exit 2
+    fi
+    stage_args=(
+      --train-jsonl "$data_dir/qwen_sft_train.jsonl"
+      --validation-jsonl "$data_dir/qwen_sft_validation.jsonl"
+      --output-dir "$run_dir"
+      --learning-rate 5e-5
+      --epochs 1
       --gradient-accumulation-steps 8
       --warmup-ratio 0.05
     )

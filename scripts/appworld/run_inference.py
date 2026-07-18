@@ -7,9 +7,11 @@
 """Run inference on AppWorld tasks."""
 
 import itertools
+import json
 import os
 import shutil
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -23,6 +25,11 @@ import phi_agents.rl.config as rl_config
 from phi_agents.evals.appworld_rollout_data import AppWorldTrainingRollout
 from phi_agents.inference.config import MainInferenceConfig
 from phi_agents.rl.parallel_scenario_sampler import ParallelScenarioSampler
+from phi_agents.rl.rollout_diagnostics import (
+    compute_rollout_diagnostics,
+    save_rollout_diagnostics,
+    save_sanitized_trajectories,
+)
 from phi_agents.rl.utils.download import download_adapter, download_model
 from phi_agents.rl.vllm_rollout_worker import VLLMRolloutWorker
 from phi_agents.utils.appworld import get_episode_path
@@ -76,7 +83,7 @@ def main(cfg: MainInferenceConfig) -> None:
 
         rollout_worker = VLLMRolloutWorker(
             scenario_sampler=sampler,
-            rollouts_per_scenario=1,
+            rollouts_per_scenario=cfg.rollouts_per_scenario,
             runner_cfg=cfg.scenario_runner,
             rank=0,
             local_rank=0,
@@ -86,9 +93,15 @@ def main(cfg: MainInferenceConfig) -> None:
             max_gpu_mem_utilization=cfg.llm.max_gpu_mem_utilization,
             num_runners=cfg.num_scenario_runners,
             llm_cfg=cfg.llm,
+            rollout_seeds=cfg.rollout_seeds,
+            start_port=cfg.start_port,
         )
 
-        n_scenarios = rl_config.appworld_split_to_num_scenarios(cfg.scenario_sampler.dataset_name)
+        n_scenarios = cfg.num_scenarios
+        if n_scenarios is None:
+            n_scenarios = rl_config.appworld_split_to_num_scenarios(
+                cfg.scenario_sampler.dataset_name
+            )
         rollout_worker.request_rollout_generation(
             n_scenarios=n_scenarios,
             adapter_path=lora_path(cfg.llm.adapter_path),
@@ -100,15 +113,65 @@ def main(cfg: MainInferenceConfig) -> None:
             rollouts_fraction=1,
         )
 
-        rollouts_flat = list(itertools.chain(*rollouts))
-
-        for rollout in rollouts_flat:
-            episode = convert_rollout_to_episode(
-                cast(AppWorldTrainingRollout, rollout), experiment_name=appworld_cfg.experiment_name
+        if cfg.rollouts_per_scenario > 1:
+            if cfg.diagnostic_output_dir is None:
+                raise ValueError(
+                    "diagnostic_output_dir is required when rollouts_per_scenario is greater than 1"
+                )
+            grouped_rollouts = cast(list[list[AppWorldTrainingRollout]], rollouts)
+            output_root = Path(cfg.diagnostic_output_dir).expanduser().resolve()
+            trajectory_paths = save_sanitized_trajectories(
+                grouped_rollouts,
+                output_root=output_root / "trajectories",
+                iteration=cfg.diagnostic_iteration,
             )
-            json_path = get_episode_path(appworld_cfg.experiment_name, episode.task.task_id)
-            episode.save(json_path)
-            logger.debug(f"Episode {episode.task.task_id=} saved to {json_path=}")
+            diagnostics = compute_rollout_diagnostics(grouped_rollouts)
+            diagnostics["run"] = {
+                "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "experiment_name": appworld_cfg.experiment_name,
+                "dataset_name": cfg.scenario_sampler.dataset_name,
+                "base_model_path": str(cfg.llm.base_model_path),
+                "adapter_path": (
+                    None if cfg.llm.adapter_path is None else str(cfg.llm.adapter_path)
+                ),
+                "temperature": cfg.llm.temperature,
+                "max_interactions": appworld_cfg.env.max_interactions,
+                "num_scenarios": n_scenarios,
+                "rollouts_per_scenario": cfg.rollouts_per_scenario,
+                "rollout_seeds": cfg.rollout_seeds,
+                "num_scenario_runners": cfg.num_scenario_runners,
+                "trajectory_count": len(trajectory_paths),
+            }
+            save_rollout_diagnostics(
+                diagnostics,
+                output_path=output_root / "rollout_diagnostics.json",
+            )
+            (output_root / "resolved_config.json").write_text(
+                json.dumps(
+                    OmegaConf.to_container(cfg, resolve=True),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            logger.info(
+                "Fixed diagnostic rollout completed: %s trajectories saved under %s",
+                len(trajectory_paths),
+                output_root,
+            )
+        else:
+            rollouts_flat = list(itertools.chain(*rollouts))
+            for rollout in rollouts_flat:
+                episode = convert_rollout_to_episode(
+                    cast(AppWorldTrainingRollout, rollout),
+                    experiment_name=appworld_cfg.experiment_name,
+                )
+                json_path = get_episode_path(appworld_cfg.experiment_name, episode.task.task_id)
+                episode.save(json_path)
+                logger.debug(f"Episode {episode.task.task_id=} saved to {json_path=}")
 
         logger.debug("Done")
 

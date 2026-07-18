@@ -13,7 +13,7 @@ import sys
 import tempfile
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -54,6 +54,11 @@ from phi_agents.rl.rl_utils import (
     inference_and_learning_share_gpus,
     is_policy_gradient_loss,
     wandb_init,
+)
+from phi_agents.rl.rollout_diagnostics import (
+    compute_rollout_diagnostics,
+    save_rollout_diagnostics,
+    save_sanitized_trajectories,
 )
 from phi_agents.rl.type_defs import TrainingRollout
 from phi_agents.rl.utils.download import (
@@ -208,6 +213,8 @@ class RolloutID:
 class PPODebugInfo:
     clipped: bool
     clipped_fraction: float
+    clipped_observations: int
+    total_observations: int
     epsilon: float
     policy_loss_1: float
     policy_loss_2: float
@@ -225,6 +232,7 @@ class RolloutLossDebugInfo:
     argmin_log_prob_diff: int
     log_importance_weight: float
     importance_weight: float
+    per_token_kl_sum: float
     advantage: float | np.ndarray
     ppo: PPODebugInfo | None
 
@@ -257,6 +265,285 @@ class RolloutStats:
     total_return: float
     n_total_tokens: int
     n_output_tokens: int
+
+
+def _finite_scalar_summary(values: Sequence[float]) -> dict[str, float | int | None]:
+    finite_values = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite_values:
+        return {
+            "count": len(values),
+            "finite_count": 0,
+            "nonfinite_count": len(values),
+            "mean": None,
+            "min": None,
+            "max": None,
+            "last": None,
+        }
+    return {
+        "count": len(values),
+        "finite_count": len(finite_values),
+        "nonfinite_count": len(values) - len(finite_values),
+        "mean": float(np.mean(finite_values)),
+        "min": min(finite_values),
+        "max": max(finite_values),
+        "last": finite_values[-1],
+    }
+
+
+def sampled_token_entropy_stats(rollouts: Sequence[TrainingRollout]) -> dict[str, Any]:
+    """Estimate sampling entropy from sampled-token surprisal without another model pass.
+
+    The result is the Monte Carlo mean of ``-log p(sampled_token)`` over output
+    tokens. It estimates categorical entropy when rollouts are sampled from the
+    reported distribution, but it is not an exact full-vocabulary entropy.
+    """
+    total_surprisal = 0.0
+    finite_output_tokens = 0
+    nonfinite_output_tokens = 0
+    for rollout in rollouts:
+        info = rollout.policy_token_info
+        for is_output, log_probability in zip(info.is_output, info.log_probs, strict=True):
+            if not is_output:
+                continue
+            if math.isfinite(float(log_probability)):
+                total_surprisal -= float(log_probability)
+                finite_output_tokens += 1
+            else:
+                nonfinite_output_tokens += 1
+
+    return {
+        "definition": "mean sampled-token surprisal -log(p), in nats",
+        "finite_output_tokens": finite_output_tokens,
+        "nonfinite_output_tokens": nonfinite_output_tokens,
+        "mean_nats": (
+            total_surprisal / finite_output_tokens if finite_output_tokens > 0 else None
+        ),
+    }
+
+
+@dataclass
+class IterationMetricAccumulator:
+    iteration: int
+    global_step_start: int
+    started_at: str = field(
+        default_factory=lambda: datetime.datetime.now(datetime.UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    attempted_gradient_steps: int = 0
+    optimizer_steps: int = 0
+    invalid_loss_steps: int = 0
+    high_kl_events: int = 0
+    per_token_kl_sum: float = 0.0
+    per_token_kl_observations: int = 0
+    ppo_clipped_observations: int = 0
+    ppo_total_observations: int = 0
+    grad_norms: list[float] = field(default_factory=list)
+    parameter_update_l2_norms: list[float] = field(default_factory=list)
+    optimizer_learning_rates: list[float] = field(default_factory=list)
+    advantage_filter: dict[str, Any] = field(default_factory=dict)
+    sampling_entropy: dict[str, Any] = field(default_factory=dict)
+    learning_rate_before_scheduler: float | None = None
+    learning_rate_after_scheduler: float | None = None
+
+    def record_gradient_observation(
+        self,
+        *,
+        per_token_kl_sum: float,
+        per_token_kl_observations: int,
+        ppo_clipped_observations: int,
+        ppo_total_observations: int,
+    ) -> None:
+        self.attempted_gradient_steps += 1
+        self.per_token_kl_sum += float(per_token_kl_sum)
+        self.per_token_kl_observations += int(per_token_kl_observations)
+        self.ppo_clipped_observations += int(ppo_clipped_observations)
+        self.ppo_total_observations += int(ppo_total_observations)
+
+    def record_optimizer_result(
+        self,
+        *,
+        grad_norm: float,
+        optimizer_stepped: bool,
+        parameter_update_l2_norm: float,
+        learning_rate: float,
+    ) -> None:
+        self.grad_norms.append(float(grad_norm))
+        if optimizer_stepped:
+            self.optimizer_steps += 1
+            self.parameter_update_l2_norms.append(float(parameter_update_l2_norm))
+            self.optimizer_learning_rates.append(float(learning_rate))
+
+    def report(
+        self,
+        *,
+        status: str,
+        global_step_end: int,
+        cumulative_high_kl_events: int,
+        failure_event: str | None = None,
+        failure_type: str | None = None,
+    ) -> dict[str, Any]:
+        per_token_kl = (
+            self.per_token_kl_sum / self.per_token_kl_observations
+            if self.per_token_kl_observations > 0
+            else None
+        )
+        clip_fraction = (
+            self.ppo_clipped_observations / self.ppo_total_observations
+            if self.ppo_total_observations > 0
+            else None
+        )
+        return {
+            "schema_version": "loop-iteration-training-metrics-v1",
+            "timestamp": datetime.datetime.now(datetime.UTC)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "status": status,
+            "iteration": self.iteration,
+            "started_at": self.started_at,
+            "global_step_start": self.global_step_start,
+            "global_step_end": global_step_end,
+            "attempted_gradient_steps": self.attempted_gradient_steps,
+            "actual_optimizer_steps": self.optimizer_steps,
+            "per_token_kl": {
+                "definition": "mean old_log_prob - new_log_prob over optimization token exposures",
+                "mean": _finite_or_none(per_token_kl),
+                "sum": _finite_or_none(self.per_token_kl_sum),
+                "token_observations": self.per_token_kl_observations,
+            },
+            "ppo_clip_fraction": {
+                "definition": "clipped PPO objective observations / PPO objective observations",
+                "fraction": clip_fraction,
+                "clipped_observations": self.ppo_clipped_observations,
+                "total_observations": self.ppo_total_observations,
+            },
+            "grad_norm_before_clipping": {
+                "definition": "global L2 norm returned before max-grad-norm clipping",
+                **_finite_scalar_summary(self.grad_norms),
+            },
+            "parameter_update_l2_norm": {
+                "definition": "global L2 norm of trainable parameter delta across actual optimizer steps",
+                **_finite_scalar_summary(self.parameter_update_l2_norms),
+            },
+            "learning_rate": {
+                "optimizer_steps": _finite_scalar_summary(self.optimizer_learning_rates),
+                "before_iteration_scheduler_step": _finite_or_none(
+                    self.learning_rate_before_scheduler
+                ),
+                "after_iteration_scheduler_step": _finite_or_none(
+                    self.learning_rate_after_scheduler
+                ),
+            },
+            "abs_adv_threshold_filter": self.advantage_filter,
+            "sampling_entropy": self.sampling_entropy,
+            "invalid_loss_steps": self.invalid_loss_steps,
+            "high_kl_events": {
+                "iteration": self.high_kl_events,
+                "cumulative": cumulative_high_kl_events,
+            },
+            "failure": (
+                {"event": failure_event, "exception_type": failure_type}
+                if failure_event is not None
+                else None
+            ),
+        }
+
+
+def _finite_or_none(value: float | None) -> float | None:
+    if value is None or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+def write_iteration_metric_report(cloud_path: Path, report: dict[str, Any]) -> Path:
+    """Atomically persist one rank-zero iteration report."""
+    iteration = int(report["iteration"])
+    path = cloud_path / "training_metrics" / f"iteration-{iteration:06d}.json"
+    data = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    scheme, raw_path = fu.get_scheme_and_path(path)
+    if scheme == "file":
+        destination = Path(raw_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+        )
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            Path(temporary_name).replace(destination)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+    else:
+        with tempfile.NamedTemporaryFile("w", delete=False) as temporary:
+            temporary.write(data)
+            temporary_name = temporary.name
+        try:
+            fu.copy(temporary_name, path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+    return path
+
+
+@torch.no_grad()
+def _snapshot_trainable_parameters(model: ModelType) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return [
+        (parameter, parameter.detach().clone())
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+
+
+@torch.no_grad()
+def _parameter_update_l2_norm(
+    snapshots: Sequence[tuple[torch.Tensor, torch.Tensor]],
+) -> float:
+    local_squared_norm: torch.Tensor | None = None
+    for parameter, before in snapshots:
+        delta = parameter.detach() - before
+        if hasattr(delta, "to_local"):
+            delta = delta.to_local()
+        delta_float = delta.float()
+        squared_norm = torch.sum(delta_float * delta_float)
+        local_squared_norm = (
+            squared_norm
+            if local_squared_norm is None
+            else local_squared_norm + squared_norm.to(local_squared_norm.device)
+        )
+    if local_squared_norm is None:
+        return 0.0
+    if dist.is_initialized():
+        dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
+    return float(torch.sqrt(local_squared_norm).item())
+
+
+def _log_training_failure(exc: BaseException) -> None:
+    """Emit one idempotent Dragon Sentinel alert without serializing exception content."""
+    if getattr(exc, "_dragon_sentinel_training_failure_logged", False):
+        return
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        logger.critical(
+            "CUDA out of memory interrupted training.",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"event": "cuda_oom"},
+        )
+    elif isinstance(exc, KeyboardInterrupt):
+        logger.error(
+            "Training was interrupted before completion.",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"event": "training_failed"},
+        )
+    else:
+        logger.error(
+            "Training failed with an unhandled exception.",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"event": "training_failed"},
+        )
+    try:
+        exc._dragon_sentinel_training_failure_logged = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
 
 
 class RLOOTrainer:
@@ -390,6 +677,7 @@ class RLOOTrainer:
         self._global_step = 0
         self._rollouts_generated = self._output_tokens_generated = 0
         self._active_iteration_manifest: tuple[int, int] | None = None
+        self._iteration_metrics: IterationMetricAccumulator | None = None
 
         self._with_wandb = self._rank == 0 and self._wandb_cfg.enable
         wandb_run_name: str | None = None
@@ -618,6 +906,134 @@ class RLOOTrainer:
         target_iteration, expected_rollouts = self._active_iteration_manifest
         self._abort_iteration_manifest(target_iteration, expected_rollouts, exc)
 
+    def _persist_iteration_metrics(
+        self,
+        *,
+        status: str,
+        failure_event: str | None = None,
+        exc: BaseException | None = None,
+    ) -> Path | None:
+        if self._rank != 0 or self._iteration_metrics is None:
+            return None
+        if (
+            self._iteration_metrics.learning_rate_after_scheduler is None
+            and self._lr_scheduler is not None
+        ):
+            self._iteration_metrics.learning_rate_after_scheduler = float(
+                self._lr_scheduler.get_last_lr()[0]
+            )
+        report = self._iteration_metrics.report(
+            status=status,
+            global_step_end=self._global_step,
+            cumulative_high_kl_events=self._high_kl_events,
+            failure_event=failure_event,
+            failure_type=type(exc).__name__ if exc is not None else None,
+        )
+        path = write_iteration_metric_report(self._cfg.cloud_path, report)
+        logger.info(
+            "Persisted iteration training metrics: iteration=%s status=%s",
+            self._iteration_metrics.iteration,
+            status,
+        )
+        return path
+
+    def _persist_failed_iteration_metrics(
+        self, exc: BaseException, *, failure_event: str
+    ) -> None:
+        try:
+            self._persist_iteration_metrics(
+                status="failed",
+                failure_event=failure_event,
+                exc=exc,
+            )
+        except Exception:
+            logger.error(
+                "Failed to persist interrupted iteration metrics.",
+                exc_info=True,
+                extra={"event": "training_metrics_persist_failed"},
+            )
+
+    def _persist_rollout_diagnostics(
+        self,
+        grouped_rollouts: list[list[TrainingRollout]],
+        *,
+        iteration: int,
+    ) -> None:
+        diagnostics_cfg = self._cfg.get("rollout_diagnostics", {})
+        if not bool(diagnostics_cfg.get("enabled", False)):
+            return
+
+        gathered: list[list[list[TrainingRollout]] | None] | None = None
+        if self._world_size > 1:
+            gathered = [None] * self._world_size if self._rank == 0 else None
+            dist.gather_object(grouped_rollouts, gathered, dst=0)
+        if self._rank != 0:
+            return
+
+        if gathered is None:
+            global_groups = grouped_rollouts
+        else:
+            global_groups = [
+                group
+                for worker_groups in gathered
+                if worker_groups is not None
+                for group in worker_groups
+            ]
+
+        from phi_agents.evals.appworld_rollout_data import AppWorldTrainingRollout
+
+        if not all(
+            isinstance(rollout, AppWorldTrainingRollout)
+            for group in global_groups
+            for rollout in group
+        ):
+            raise TypeError(
+                "rl.rollout_diagnostics is only supported for AppWorld training rollouts"
+            )
+        appworld_groups = cast(list[list[AppWorldTrainingRollout]], global_groups)
+
+        scheme, raw_cloud_path = fu.get_scheme_and_path(self._cfg.cloud_path)
+        if scheme != "file":
+            raise ValueError(
+                "rl.rollout_diagnostics currently requires a local file cloud_path"
+            )
+        run_path = Path(raw_cloud_path)
+        diagnostics = compute_rollout_diagnostics(
+            appworld_groups,
+            baseline=self._cfg.params.baseline,
+            adv_normalization=self._cfg.params.adv_normalization,
+            abs_adv_threshold=self._cfg.params.abs_adv_threshold,
+            pos_adv_only=self._cfg.params.pos_adv_only,
+        )
+        diagnostics["training_iteration"] = iteration
+        diagnostics["scenario_task_ids"] = [
+            group[0].appworld_rollout_data.task.task_id for group in appworld_groups
+        ]
+        save_rollout_diagnostics(
+            diagnostics,
+            output_path=(
+                run_path
+                / "rollout_diagnostics"
+                / f"iteration-{iteration:06d}.json"
+            ),
+        )
+        trajectory_count = 0
+        if bool(diagnostics_cfg.get("save_trajectories", True)):
+            trajectory_count = len(
+                save_sanitized_trajectories(
+                    appworld_groups,
+                    output_root=run_path / "rollouts",
+                    iteration=iteration,
+                )
+            )
+        logger.info(
+            "Persisted LOOP rollout diagnostics: iteration=%s groups=%s trajectories=%s",
+            iteration,
+            len(appworld_groups),
+            trajectory_count,
+            extra={"event": "loop_rollout_diagnostics_saved"},
+        )
+
     def _compile_model(self, model: ModelType) -> None:
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
         from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
@@ -735,7 +1151,7 @@ class RLOOTrainer:
 
     def _filter_rollouts(
         self, rollouts: list[TrainingRollout], adv_estimates: np.ndarray, ids: list[RolloutID]
-    ) -> tuple[list[RolloutsAdvantagesIDs], float, float]:
+    ) -> tuple[list[RolloutsAdvantagesIDs], float, float, dict[str, Any]]:
         # sort by decreasing absolute value
         # NOTE: Assume that adv threshold >= 0 and therefore neg adv will be filtered out later
         #       when pos_adv_only is true
@@ -748,6 +1164,12 @@ class RLOOTrainer:
         sorted_abs_adv = abs_adv[indices]
 
         adv_threshold = self._cfg.params.abs_adv_threshold
+        output_tokens = [sum(rollout.policy_token_info.is_output) for rollout in rollouts]
+        below_threshold = sorted_abs_adv < adv_threshold
+        below_threshold_rollouts = [
+            sorted_rollouts[index]
+            for index in np.where(below_threshold)[0]
+        ]
 
         # this can be O(logn) but linear time here should be fine
         keep_indices = np.where(sorted_abs_adv >= adv_threshold)[0]
@@ -771,6 +1193,26 @@ class RLOOTrainer:
         empirical_adv_filter_threshold = float(
             sorted_abs_adv[n_keep] if n_keep < len(rollouts) else 0.0
         )
+        retained_output_tokens = sum(
+            sum(rollout.policy_token_info.is_output) for rollout in sorted_rollouts[:n_keep]
+        )
+        filter_stats = {
+            "definition": "output-token counts use complete rollout token metadata before sequence truncation",
+            "configured_threshold": float(adv_threshold),
+            "empirical_threshold_after_world_size_rounding": empirical_adv_filter_threshold,
+            "actually_filtered_rollout_fraction": adv_filtered_fraction,
+            "candidate_rollouts": len(sorted_rollouts),
+            "candidate_output_tokens": sum(output_tokens),
+            "below_threshold_rollouts": len(below_threshold_rollouts),
+            "below_threshold_output_tokens": sum(
+                sum(rollout.policy_token_info.is_output)
+                for rollout in below_threshold_rollouts
+            ),
+            "retained_rollouts_after_world_size_rounding": n_keep,
+            "retained_output_tokens_after_world_size_rounding": retained_output_tokens,
+            "actually_filtered_rollouts": len(sorted_rollouts) - n_keep,
+            "actually_filtered_output_tokens": sum(output_tokens) - retained_output_tokens,
+        }
 
         logger.info(f"{n_keep=} {adv_filtered_fraction=:.2f} {empirical_adv_filter_threshold=:.5f}")
 
@@ -796,7 +1238,12 @@ class RLOOTrainer:
                 )
             )
 
-        return rollout_subsets, adv_filtered_fraction, empirical_adv_filter_threshold
+        return (
+            rollout_subsets,
+            adv_filtered_fraction,
+            empirical_adv_filter_threshold,
+            filter_stats,
+        )
 
     def _reduce_stats(self, rollouts: list[TrainingRollout]) -> RolloutStats:
         n_rollouts = torch.tensor(len(rollouts), device=self._device, dtype=torch.int)
@@ -900,8 +1347,11 @@ class RLOOTrainer:
         clip_threshold = g(adv)
 
         # binary 0/1 for full trajectories, fractional value for token-based clipping
-        ppo_clipped_fraction = float((objective > clip_threshold).detach().float().mean().cpu())
-        ppo_clipped_debug = ppo_clipped_fraction > 0
+        clipped_mask = (objective > clip_threshold).detach()
+        ppo_clipped_observations = int(clipped_mask.sum().cpu())
+        ppo_total_observations = clipped_mask.numel()
+        ppo_clipped_fraction = ppo_clipped_observations / ppo_total_observations
+        ppo_clipped_debug = ppo_clipped_observations > 0
         objective = torch.minimum(objective, clip_threshold)
 
         # just to check against this version
@@ -922,9 +1372,11 @@ class RLOOTrainer:
         loss = -objective
 
         debug_info = PPODebugInfo(
-            ppo_clipped_debug,
-            ppo_clipped_fraction,
-            self._cfg.params.ppo_epsilon,
+            clipped=ppo_clipped_debug,
+            clipped_fraction=ppo_clipped_fraction,
+            clipped_observations=ppo_clipped_observations,
+            total_observations=ppo_total_observations,
+            epsilon=self._cfg.params.ppo_epsilon,
             policy_loss_1=float(policy_loss_1.detach().mean().cpu()),
             policy_loss_2=float(policy_loss_2.detach().mean().cpu()),
         )
@@ -975,18 +1427,19 @@ class RLOOTrainer:
         argmax_log_prob_diff = int(diff_log_probs.argmax())
         argmin_log_prob_diff = int(diff_log_probs.argmin())
         debug_info = RolloutLossDebugInfo(
-            float(loss.detach().cpu()),
-            n_tokens,
-            n_output_tokens,
-            truncated,
-            float(diff_log_probs[argmax_log_prob_diff]),
-            float(diff_log_probs[argmin_log_prob_diff]),
-            argmax_log_prob_diff,
-            argmin_log_prob_diff,
-            trajectory_log_importance_weight,
-            float(trajectory_importance_weight.detach().cpu()),
-            advantage_estimates.detach().cpu().numpy(),
-            ppo_debug_info,
+            loss=float(loss.detach().cpu()),
+            n_tokens=n_tokens,
+            n_output_tokens=n_output_tokens,
+            truncated=truncated,
+            max_log_prob_diff=float(diff_log_probs[argmax_log_prob_diff]),
+            min_log_prob_diff=float(diff_log_probs[argmin_log_prob_diff]),
+            argmax_log_prob_diff=argmax_log_prob_diff,
+            argmin_log_prob_diff=argmin_log_prob_diff,
+            log_importance_weight=trajectory_log_importance_weight,
+            importance_weight=float(trajectory_importance_weight.detach().cpu()),
+            per_token_kl_sum=float(-diff_log_probs.sum()),
+            advantage=advantage_estimates.detach().cpu().numpy(),
+            ppo=ppo_debug_info,
         )
 
         return loss, debug_info
@@ -1145,10 +1598,11 @@ class RLOOTrainer:
         self,
         model: ModelType,
         optimizer: Optimizer,
-    ) -> float:
+    ) -> tuple[float, bool, float]:
         """Here in addition to clipping we (optionally) entirely reject gradients
         that exceed the max norm, or their norm is at least a 5 sigma outlier.
-        Returns grad norm.
+        Returns pre-clipping grad norm, whether the optimizer stepped, and the
+        post-step trainable-parameter update L2 norm.
         """
         if self._cfg.fsdp:
             grad_norm_tensor = self.clip_grad_norm_fsdp_(
@@ -1170,12 +1624,16 @@ class RLOOTrainer:
             logger.warning(
                 f"rank{self._rank}: Skipped gradient update due to large {grad_norm=}, {self._n_outlier_grads=}"
             )
+            optimizer_stepped = False
+            parameter_update_l2_norm = 0.0
         else:
+            parameter_snapshots = _snapshot_trainable_parameters(model)
             optimizer.step()
-
+            parameter_update_l2_norm = _parameter_update_l2_norm(parameter_snapshots)
+            optimizer_stepped = True
             self._grad_rms.update(grad_norm)
 
-        return grad_norm
+        return grad_norm, optimizer_stepped, parameter_update_l2_norm
 
     def _gradient_step(
         self,
@@ -1222,6 +1680,34 @@ class RLOOTrainer:
         else:
             all_log_importance_weights = log_importance_weights
 
+        local_metric_totals = torch.tensor(
+            [
+                sum(info.per_token_kl_sum for info in loss_debug_infos),
+                sum(info.n_output_tokens for info in loss_debug_infos),
+                sum(
+                    info.ppo.clipped_observations
+                    for info in loss_debug_infos
+                    if info.ppo is not None
+                ),
+                sum(
+                    info.ppo.total_observations
+                    for info in loss_debug_infos
+                    if info.ppo is not None
+                ),
+            ],
+            dtype=torch.float64,
+            device=self._device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(local_metric_totals, op=dist.ReduceOp.SUM)
+        if self._iteration_metrics is not None:
+            self._iteration_metrics.record_gradient_observation(
+                per_token_kl_sum=float(local_metric_totals[0].item()),
+                per_token_kl_observations=int(local_metric_totals[1].item()),
+                ppo_clipped_observations=int(local_metric_totals[2].item()),
+                ppo_total_observations=int(local_metric_totals[3].item()),
+            )
+
         invalid_loss = math.isnan(avg_loss)
 
         all_kl_estimate = kl_estimate(all_log_importance_weights)
@@ -1234,6 +1720,8 @@ class RLOOTrainer:
 
         if invalid_loss:
             self._invalid_steps_skipped += 1
+            if self._iteration_metrics is not None:
+                self._iteration_metrics.invalid_loss_steps += 1
             logger.error(
                 f"rank{self._rank}: Skipping an optimizer step! {self._invalid_steps_skipped}"
             )
@@ -1244,6 +1732,8 @@ class RLOOTrainer:
                 )
         elif high_kl:
             self._high_kl_events += 1
+            if self._iteration_metrics is not None:
+                self._iteration_metrics.high_kl_events += 1
             logger.warning(
                 f"rank{self._rank}: Stopping the training iteration early because of {high_kl=}, {all_kl_estimate=}"
             )
@@ -1255,7 +1745,18 @@ class RLOOTrainer:
                     profile("optimizer_step"),
                     NVMLPeakMemProfiler("optimizer_step", logger=self._rank0_logger),
                 ):
-                    grad_norm = self._maybe_optimizer_step(model, optimizer)
+                    (
+                        grad_norm,
+                        optimizer_stepped,
+                        parameter_update_l2_norm,
+                    ) = self._maybe_optimizer_step(model, optimizer)
+                if self._iteration_metrics is not None:
+                    self._iteration_metrics.record_optimizer_result(
+                        grad_norm=grad_norm,
+                        optimizer_stepped=optimizer_stepped,
+                        parameter_update_l2_norm=parameter_update_l2_norm,
+                        learning_rate=float(optimizer.param_groups[0]["lr"]),
+                    )
             else:
                 raise AssertionError(f"{self._cfg.fsdp=}")
 
@@ -1664,6 +2165,10 @@ class RLOOTrainer:
         for _ in range(self._iterations_completed, self._cfg.params.total_iterations):
             self._callbacks.before_iteration(self._iterations_completed, last_checkpoint_local_path)
             target_iteration = self._target_iteration()
+            self._iteration_metrics = IterationMetricAccumulator(
+                iteration=target_iteration,
+                global_step_start=self._global_step,
+            )
             expected_rollouts = self._expected_rollouts_per_iteration()
             self._begin_iteration_manifest(target_iteration, expected_rollouts)
             self._active_iteration_manifest = (target_iteration, expected_rollouts)
@@ -1706,6 +2211,7 @@ class RLOOTrainer:
             self._commit_iteration_manifest(
                 target_iteration, expected_rollouts, finished_rollouts
             )
+            self._persist_rollout_diagnostics(rollouts, iteration=target_iteration)
             with profile("recycle_scenario_runners"), timeit(
                 "recycle_scenario_runners", logger
             ):
@@ -1758,7 +2264,12 @@ class RLOOTrainer:
                         all_rollouts_and_adv_and_ids,
                         adv_filtered_fraction,
                         empirical_adv_filter_threshold,
+                        advantage_filter_stats,
                     ) = self._filter_rollouts(all_rollouts, all_adv_estimates, all_ids)
+                    self._iteration_metrics.advantage_filter = advantage_filter_stats
+                    self._iteration_metrics.sampling_entropy = sampled_token_entropy_stats(
+                        all_rollouts
+                    )
                 else:
                     all_rollouts_and_adv_and_ids = None
 
@@ -1815,7 +2326,13 @@ class RLOOTrainer:
             # We need to know the total number of steps to define the schedule, and the total
             # number of SGD steps is unknown due to adv. filtering, while the total number of RL
             # iterations is currently predetermined.
+            self._iteration_metrics.learning_rate_before_scheduler = float(
+                self._lr_scheduler.get_last_lr()[0]
+            )
             self._lr_scheduler.step()
+            self._iteration_metrics.learning_rate_after_scheduler = float(
+                self._lr_scheduler.get_last_lr()[0]
+            )
 
             self._iterations_completed += 1
             n_rollouts = all_rollout_stats.n_rollouts
@@ -1851,6 +2368,7 @@ class RLOOTrainer:
             self._save_lora_checkpoint(last_checkpoint_local_path)
             self._cloud_checkpointer.on_save()
             self._active_iteration_manifest = None
+            self._persist_iteration_metrics(status="completed")
 
             if self._exclusive_inference_and_learning:
                 # inference and learning don't fit in memory together; free up CUDA memory:
@@ -1887,18 +2405,25 @@ class RLOOTrainer:
                 self._speedometer.log_summary(logger)
 
             self._callbacks.after_iteration(self._iterations_completed)
+            self._iteration_metrics = None
 
     def run(self) -> None:
         try:
             self._run()
         except KeyboardInterrupt as exc:
             self._abort_active_iteration_manifest(exc)
-            logger.error("Interrupted!")
+            self._persist_failed_iteration_metrics(exc, failure_event="training_failed")
+            _log_training_failure(exc)
+            raise
+        except torch.cuda.OutOfMemoryError as exc:
+            self._abort_active_iteration_manifest(exc)
+            self._persist_failed_iteration_metrics(exc, failure_event="cuda_oom")
+            _log_training_failure(exc)
             raise
         except Exception as exc:
             self._abort_active_iteration_manifest(exc)
-            # log the exception, labeled with the appropriate rank
-            logger.exception("An error occurred in run()")
+            self._persist_failed_iteration_metrics(exc, failure_event="training_failed")
+            _log_training_failure(exc)
             raise
         finally:
             logger.info("Finished!")
@@ -1939,8 +2464,11 @@ def main() -> int:
     try:
         trainer = RLOOTrainer(accelerator, _cfg, local_rank, rank, world_size)
         trainer.run()
-    except Exception:
-        logger.error("Exception occurred", exc_info=True)
+    except KeyboardInterrupt as exc:
+        _log_training_failure(exc)
+        raise
+    except Exception as exc:
+        _log_training_failure(exc)
         status = 1
     finally:
         accelerator.end_training()

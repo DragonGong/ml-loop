@@ -1,0 +1,1544 @@
+{
+  "dataset_name": "train_difficulty_1_2",
+  "expected_task_count": 72,
+  "expected_task_ids_sha256": "7467f7d8d9da0838ad06d056bb6a76adcc6647d3c695407e68a6624f701a20f5",
+  "iterations": [
+    {
+      "iteration": 1,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "76f2c72_1"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "aa8502b_3"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "ce359b5_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "76f2c72_2"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "27e1026_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "e85d92a_2"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "2a163ab_2"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "d0b1f43_3"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "29caf6f_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "76f2c72_3"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "ce359b5_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "07b42fd_2"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "6ea6792_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "07b42fd_1"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "771d8fc_2"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "ccb4494_2"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "287e338_3"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "cf6abd2_2"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "82e2fac_3"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "29caf6f_1"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "692c77d_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "229360a_1"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "60d0b5b_1"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "c901732_3"
+        }
+      ]
+    },
+    {
+      "iteration": 2,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "229360a_2"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "2a163ab_1"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "60d0b5b_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "c901732_1"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "692c77d_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "d0b1f43_2"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "e3d6c94_1"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "287e338_2"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "ccb4494_1"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "7d7fbf6_2"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "6ea6792_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "ce359b5_3"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "6ea6792_3"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "cf6abd2_1"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "b7a9ee9_3"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "287e338_1"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "7d7fbf6_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "c901732_2"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "e85d92a_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "7d7fbf6_3"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "302c169_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "60d0b5b_3"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "cf6abd2_3"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "302c169_1"
+        }
+      ]
+    },
+    {
+      "iteration": 3,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "2a163ab_3"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "27e1026_1"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "771d8fc_3"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "d0b1f43_1"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "aa8502b_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "b7a9ee9_1"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "e7a10f8_1"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "692c77d_1"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "ccb4494_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "82e2fac_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "e3d6c94_3"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "229360a_3"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "302c169_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "29caf6f_2"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "27e1026_3"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "07b42fd_3"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "e85d92a_3"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "aa8502b_1"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "82e2fac_2"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "e7a10f8_2"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "e7a10f8_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "b7a9ee9_2"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "e3d6c94_2"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "771d8fc_1"
+        }
+      ]
+    },
+    {
+      "iteration": 4,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "229360a_3"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "302c169_2"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "cf6abd2_3"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "229360a_2"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "aa8502b_3"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "e7a10f8_1"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "302c169_1"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "cf6abd2_1"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "e85d92a_2"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "29caf6f_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "27e1026_2"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "6ea6792_2"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "e85d92a_3"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "e7a10f8_3"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "e85d92a_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "2a163ab_3"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "60d0b5b_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "771d8fc_2"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "07b42fd_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "cf6abd2_2"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "ccb4494_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "2a163ab_1"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "27e1026_3"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "2a163ab_2"
+        }
+      ]
+    },
+    {
+      "iteration": 5,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "287e338_2"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "771d8fc_3"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "aa8502b_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "c901732_3"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "302c169_3"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "29caf6f_3"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "e7a10f8_2"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "b7a9ee9_2"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "e3d6c94_1"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "aa8502b_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "07b42fd_3"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "76f2c72_1"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "b7a9ee9_1"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "76f2c72_2"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "ce359b5_3"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "b7a9ee9_3"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "7d7fbf6_3"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "e3d6c94_3"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "82e2fac_3"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "60d0b5b_3"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "76f2c72_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "60d0b5b_2"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "7d7fbf6_2"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "29caf6f_2"
+        }
+      ]
+    },
+    {
+      "iteration": 6,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "692c77d_1"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "ce359b5_2"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "7d7fbf6_1"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "ce359b5_1"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "d0b1f43_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "771d8fc_1"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "692c77d_3"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "27e1026_1"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "82e2fac_2"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "82e2fac_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "287e338_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "c901732_2"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "d0b1f43_1"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "287e338_3"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "6ea6792_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "6ea6792_3"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "229360a_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "ccb4494_1"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "692c77d_2"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "ccb4494_2"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "07b42fd_2"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "d0b1f43_3"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "c901732_1"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "e3d6c94_2"
+        }
+      ]
+    },
+    {
+      "iteration": 7,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "60d0b5b_2"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "27e1026_3"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "29caf6f_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "692c77d_2"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "c901732_3"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "b7a9ee9_3"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "cf6abd2_2"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "e3d6c94_3"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "ccb4494_2"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "27e1026_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "76f2c72_2"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "29caf6f_3"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "27e1026_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "76f2c72_3"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "7d7fbf6_2"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "b7a9ee9_1"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "aa8502b_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "82e2fac_3"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "76f2c72_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "aa8502b_2"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "e85d92a_2"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "ce359b5_2"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "771d8fc_1"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "d0b1f43_3"
+        }
+      ]
+    },
+    {
+      "iteration": 8,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "e85d92a_1"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "e7a10f8_3"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "229360a_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "e85d92a_3"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "ce359b5_1"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "d0b1f43_1"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "60d0b5b_1"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "ce359b5_3"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "aa8502b_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "82e2fac_2"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "d0b1f43_2"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "2a163ab_1"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "e3d6c94_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "cf6abd2_1"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "e3d6c94_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "287e338_2"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "7d7fbf6_3"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "e7a10f8_1"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "6ea6792_2"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "302c169_2"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "771d8fc_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "c901732_2"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "229360a_1"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "c901732_1"
+        }
+      ]
+    },
+    {
+      "iteration": 9,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "287e338_3"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "07b42fd_2"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "07b42fd_3"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "ccb4494_3"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "302c169_1"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "29caf6f_1"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "07b42fd_1"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "302c169_3"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "692c77d_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "2a163ab_3"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "6ea6792_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "cf6abd2_3"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "771d8fc_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "e7a10f8_2"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "82e2fac_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "2a163ab_2"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "ccb4494_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "229360a_3"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "7d7fbf6_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "692c77d_1"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "287e338_1"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "60d0b5b_3"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "b7a9ee9_2"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "6ea6792_3"
+        }
+      ]
+    },
+    {
+      "iteration": 10,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "27e1026_3"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "287e338_1"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "e3d6c94_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "287e338_2"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "302c169_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "29caf6f_2"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "b7a9ee9_2"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "c901732_3"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "e85d92a_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "29caf6f_3"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "e7a10f8_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "07b42fd_1"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "2a163ab_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "c901732_2"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "29caf6f_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "82e2fac_2"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "ce359b5_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "76f2c72_2"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "aa8502b_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "c901732_1"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "2a163ab_1"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "27e1026_1"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "ccb4494_3"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "60d0b5b_3"
+        }
+      ]
+    },
+    {
+      "iteration": 11,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "7d7fbf6_1"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "76f2c72_3"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "692c77d_1"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "229360a_2"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "d0b1f43_1"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "60d0b5b_2"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "e7a10f8_2"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "aa8502b_2"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "302c169_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "692c77d_3"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "76f2c72_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "cf6abd2_1"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "e3d6c94_1"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "ccb4494_2"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "27e1026_2"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "7d7fbf6_2"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "aa8502b_3"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "302c169_1"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "771d8fc_2"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "07b42fd_3"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "287e338_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "692c77d_2"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "771d8fc_3"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "60d0b5b_1"
+        }
+      ]
+    },
+    {
+      "iteration": 12,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "e7a10f8_3"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "b7a9ee9_3"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "6ea6792_1"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "cf6abd2_3"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "d0b1f43_3"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "d0b1f43_2"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "82e2fac_3"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "6ea6792_2"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "e3d6c94_3"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "ccb4494_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "b7a9ee9_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "ce359b5_2"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "07b42fd_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "771d8fc_1"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "229360a_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "229360a_3"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "ce359b5_3"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "2a163ab_3"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "cf6abd2_2"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "6ea6792_3"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "7d7fbf6_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "e85d92a_1"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "e85d92a_2"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "82e2fac_1"
+        }
+      ]
+    },
+    {
+      "iteration": 13,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "287e338_2"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "7d7fbf6_1"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "e7a10f8_3"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "e7a10f8_2"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "d0b1f43_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "692c77d_1"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "6ea6792_3"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "60d0b5b_1"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "771d8fc_1"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "27e1026_3"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "6ea6792_2"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "692c77d_3"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "2a163ab_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "e85d92a_2"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "07b42fd_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "b7a9ee9_2"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "229360a_2"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "60d0b5b_3"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "287e338_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "27e1026_2"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "82e2fac_2"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "302c169_3"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "b7a9ee9_1"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "aa8502b_2"
+        }
+      ]
+    },
+    {
+      "iteration": 14,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "07b42fd_3"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "cf6abd2_1"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "d0b1f43_1"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "2a163ab_3"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "d0b1f43_3"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "76f2c72_3"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "302c169_1"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "29caf6f_2"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "ccb4494_2"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "771d8fc_3"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "82e2fac_1"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "287e338_3"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "60d0b5b_2"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "c901732_3"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "e85d92a_1"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "29caf6f_1"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "c901732_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "771d8fc_2"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "7d7fbf6_3"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "aa8502b_3"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "82e2fac_3"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "e7a10f8_1"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "302c169_2"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "e3d6c94_2"
+        }
+      ]
+    },
+    {
+      "iteration": 15,
+      "observed_rollouts": 144,
+      "scenarios": [
+        {
+          "scenario_idx": 0,
+          "task_id": "07b42fd_2"
+        },
+        {
+          "scenario_idx": 1,
+          "task_id": "76f2c72_1"
+        },
+        {
+          "scenario_idx": 2,
+          "task_id": "692c77d_2"
+        },
+        {
+          "scenario_idx": 3,
+          "task_id": "e3d6c94_3"
+        },
+        {
+          "scenario_idx": 4,
+          "task_id": "7d7fbf6_2"
+        },
+        {
+          "scenario_idx": 5,
+          "task_id": "ce359b5_3"
+        },
+        {
+          "scenario_idx": 6,
+          "task_id": "29caf6f_3"
+        },
+        {
+          "scenario_idx": 7,
+          "task_id": "b7a9ee9_3"
+        },
+        {
+          "scenario_idx": 8,
+          "task_id": "cf6abd2_2"
+        },
+        {
+          "scenario_idx": 9,
+          "task_id": "27e1026_1"
+        },
+        {
+          "scenario_idx": 10,
+          "task_id": "c901732_2"
+        },
+        {
+          "scenario_idx": 11,
+          "task_id": "ccb4494_1"
+        },
+        {
+          "scenario_idx": 12,
+          "task_id": "ccb4494_3"
+        },
+        {
+          "scenario_idx": 13,
+          "task_id": "e3d6c94_1"
+        },
+        {
+          "scenario_idx": 14,
+          "task_id": "76f2c72_2"
+        },
+        {
+          "scenario_idx": 15,
+          "task_id": "cf6abd2_3"
+        },
+        {
+          "scenario_idx": 16,
+          "task_id": "229360a_1"
+        },
+        {
+          "scenario_idx": 17,
+          "task_id": "aa8502b_1"
+        },
+        {
+          "scenario_idx": 18,
+          "task_id": "2a163ab_1"
+        },
+        {
+          "scenario_idx": 19,
+          "task_id": "229360a_3"
+        },
+        {
+          "scenario_idx": 20,
+          "task_id": "6ea6792_1"
+        },
+        {
+          "scenario_idx": 21,
+          "task_id": "ce359b5_2"
+        },
+        {
+          "scenario_idx": 22,
+          "task_id": "ce359b5_1"
+        },
+        {
+          "scenario_idx": 23,
+          "task_id": "e85d92a_3"
+        }
+      ]
+    }
+  ],
+  "kind": "appworld_loop_scenario_manifest",
+  "num_iterations": 15,
+  "rollouts_per_scenario": 6,
+  "scenarios_per_iteration": 24,
+  "schema_version": 1,
+  "source_log_sha256": "e7762839b6e9f67b493aa155c5c1ecb93d52e7307c0097eb950782b15b9c6af3",
+  "source_log_size_bytes": 8267331
+}

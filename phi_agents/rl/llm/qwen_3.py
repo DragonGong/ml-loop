@@ -262,7 +262,7 @@ class VLLMQwen3(TrainableLLM):
 
         return running_tokens_list, is_output_list, log_probs_list
 
-    def generate(self, messages: list[Message]) -> PolicyMessage:
+    def generate(self, messages: list[Message], *, seed: int | None = None) -> PolicyMessage:
         r"""Generate a (policy) message response to messages.
 
         Tokenization note:
@@ -305,6 +305,7 @@ class VLLMQwen3(TrainableLLM):
             top_k=self._top_k,
             frequency_penalty=self._frequency_penalty,
             max_new_tokens=max_new_tokens,
+            seed=seed,
         )
         text_tokens = []
         text_content = ""

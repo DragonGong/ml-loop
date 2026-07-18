@@ -13,6 +13,7 @@ from phi_agents.sft.trainer import (
     SFTConfig,
     TokenizedSFTDataset,
     train,
+    training_schedule_preflight,
 )
 
 if TYPE_CHECKING:
@@ -53,6 +54,31 @@ def _gradient_capture() -> Any:
             }
 
     return GradientCapture()
+
+
+@pytest.mark.parametrize(
+    ("train_windows", "expected_steps", "expected_warmup"),
+    ((271, 34, 2), (545, 69, 4)),
+)
+def test_one_epoch_schedule_preflight(
+    tmp_path: Path, train_windows: int, expected_steps: int, expected_warmup: int
+) -> None:
+    schedule = training_schedule_preflight(
+        SFTConfig(
+            train_jsonl=tmp_path / "train.jsonl",
+            validation_jsonl=tmp_path / "validation.jsonl",
+            output_dir=tmp_path / "output",
+            epochs=1,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
+            warmup_ratio=0.05,
+        ),
+        train_windows,
+    )
+    assert schedule["optimizer_steps_per_epoch"] == expected_steps
+    assert schedule["expected_optimizer_steps"] == expected_steps
+    assert schedule["scheduler_total_steps"] == expected_steps
+    assert schedule["warmup_steps"] == expected_warmup
 
 
 class _TinyCausalLM(torch.nn.Module):
