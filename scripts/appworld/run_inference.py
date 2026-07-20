@@ -138,7 +138,7 @@ def main(cfg: MainInferenceConfig) -> None:
                 "max_interactions": appworld_cfg.env.max_interactions,
                 "num_scenarios": n_scenarios,
                 "rollouts_per_scenario": cfg.rollouts_per_scenario,
-                "rollout_seeds": cfg.rollout_seeds,
+                "rollout_seeds": list(cfg.rollout_seeds),
                 "num_scenario_runners": cfg.num_scenario_runners,
                 "trajectory_count": len(trajectory_paths),
             }
