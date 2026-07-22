@@ -21,7 +21,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-export TMPDIR="${TMPDIR:-/data/ganpa/dragongong/tmp/qwen35-sft-$label}"
+export TMPDIR="${TMPDIR:-/tmp/q35-$label}"
 export RAY_TMPDIR="$TMPDIR"
 mkdir -p "$summary_dir" "$TMPDIR"
 
