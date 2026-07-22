@@ -53,13 +53,13 @@ if [[ "$stage" == "audit" ]]; then
 fi
 
 expected_gpu_count="$(awk -F, '{print NF}' <<< "$cuda_devices")"
-if [[ "$expected_gpu_count" != "2" ]]; then
-  echo "Training requires exactly two CUDA devices; got CUDA_VISIBLE_DEVICES=$cuda_devices" >&2
+if [[ "$expected_gpu_count" != "2" && "$expected_gpu_count" != "4" ]]; then
+  echo "Training requires two or four CUDA devices; got CUDA_VISIBLE_DEVICES=$cuda_devices" >&2
   exit 5
 fi
 visible_gpu_count="$($python_bin -c 'import torch; print(torch.cuda.device_count())')"
-if [[ "$visible_gpu_count" != "2" ]]; then
-  echo "Expected two visible GPUs, found $visible_gpu_count" >&2
+if [[ "$visible_gpu_count" != "$expected_gpu_count" ]]; then
+  echo "Expected $expected_gpu_count visible GPUs, found $visible_gpu_count" >&2
   exit 6
 fi
 compute_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null \
@@ -73,6 +73,15 @@ if ((available_kb < 32 * 1024 * 1024)); then
   echo "MemAvailable is below 32 GiB before training" >&2
   exit 8
 fi
+
+gradient_accumulation_for_global_batch() {
+  local global_batch="$1"
+  if ((global_batch < expected_gpu_count || global_batch % expected_gpu_count != 0)); then
+    echo "Global batch $global_batch is not divisible by world size $expected_gpu_count" >&2
+    return 1
+  fi
+  printf '%s' "$((global_batch / expected_gpu_count))"
+}
 
 common_args=(
   --model-name Qwen/Qwen3.5-4B
@@ -148,19 +157,27 @@ case "$stage" in
   d12)
     output_dir="$root/training/d12"
     data_dir="$data_root/d12_supervision_v2"
+    global_batch_size="${D12_GLOBAL_BATCH_SIZE:-8}"
+    gradient_accumulation_steps="$(
+      gradient_accumulation_for_global_batch "$global_batch_size"
+    )"
     stage_args=(
       --train-jsonl "$data_dir/qwen_sft_train.jsonl"
       --validation-jsonl "$data_dir/qwen_sft_validation.jsonl"
       --output-dir "$output_dir"
       --learning-rate 5e-5
       --epochs 1
-      --gradient-accumulation-steps 4
+      --gradient-accumulation-steps "$gradient_accumulation_steps"
       --warmup-ratio 0.05
     )
     ;;
   d3)
     output_dir="$root/training/d3"
     data_dir="$data_root/d3_supervision_v2"
+    global_batch_size="${D3_GLOBAL_BATCH_SIZE:-4}"
+    gradient_accumulation_steps="$(
+      gradient_accumulation_for_global_batch "$global_batch_size"
+    )"
     d12_adapter="$root/training/d12/final_adapter"
     if [[ ! -f "$d12_adapter/adapter_model.safetensors" ]]; then
       echo "D1/2 final adapter is missing: $d12_adapter" >&2
@@ -173,7 +190,7 @@ case "$stage" in
       --initial-adapter "$d12_adapter"
       --learning-rate 1e-5
       --epochs 2
-      --gradient-accumulation-steps 2
+      --gradient-accumulation-steps "$gradient_accumulation_steps"
       --warmup-ratio 0.10
     )
     ;;
@@ -201,7 +218,7 @@ command=(
   "$python_bin" -m phi_agents.sft.launch --
   "$python_bin" -m torch.distributed.run
   --standalone
-  --nproc-per-node 2
+  --nproc-per-node "$expected_gpu_count"
   -m phi_agents.sft.trainer
   "${stage_args[@]}"
   "${common_args[@]}"
@@ -212,7 +229,9 @@ command=(
   printf 'command='
   printf '%q ' "${command[@]}"
   echo
-  echo "stage=$stage cuda_devices=$cuda_devices cpu_offload=$cpu_offload"
+  echo "stage=$stage cuda_devices=$cuda_devices world_size=$expected_gpu_count " \
+    "global_batch=${global_batch_size:-$expected_gpu_count} " \
+    "gradient_accumulation=${gradient_accumulation_steps:-1} cpu_offload=$cpu_offload"
   echo "nccl_p2p=$NCCL_P2P_DISABLE nccl_ib=$NCCL_IB_DISABLE " \
     "nccl_cumem=$NCCL_CUMEM_ENABLE nccl_nvls=$NCCL_NVLS_ENABLE"
   free -h

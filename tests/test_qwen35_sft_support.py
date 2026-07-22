@@ -261,3 +261,37 @@ def test_two_gpu_schedule_counts_global_optimizer_steps(tmp_path, monkeypatch) -
     assert d3["global_batch_size"] == 4
     assert d3["optimizer_steps_per_epoch"] == 21
     assert d3["expected_optimizer_steps"] == 42
+
+
+def test_four_gpu_schedule_preserves_two_stage_global_batches(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    d12 = training_schedule_preflight(
+        SFTConfig(
+            train_jsonl=tmp_path / "train.jsonl",
+            validation_jsonl=tmp_path / "validation.jsonl",
+            output_dir=tmp_path / "d12",
+            epochs=1,
+            gradient_accumulation_steps=2,
+        ),
+        509,
+    )
+    d3 = training_schedule_preflight(
+        SFTConfig(
+            train_jsonl=tmp_path / "train.jsonl",
+            validation_jsonl=tmp_path / "validation.jsonl",
+            output_dir=tmp_path / "d3",
+            epochs=2,
+            gradient_accumulation_steps=1,
+        ),
+        81,
+    )
+
+    assert d12["world_size"] == 4
+    assert d12["global_batch_size"] == 8
+    assert d12["optimizer_steps_per_epoch"] == 64
+    assert d12["expected_optimizer_steps"] == 64
+    assert d3["global_batch_size"] == 4
+    assert d3["optimizer_steps_per_epoch"] == 21
+    assert d3["expected_optimizer_steps"] == 42
