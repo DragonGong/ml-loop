@@ -4,7 +4,8 @@ from pathlib import Path
 from phi_agents.rl.config import get_config
 from phi_agents.rl.llm import qwen_3
 from phi_agents.vllm import vllm_server
-from scripts.loop7b.eval_watch import _experiment_name
+from phi_agents.utils.file_utils import lora_path
+from scripts.loop7b.eval_watch import _experiment_name, _is_adapter_directory
 
 
 class _FakeTokenizer:
@@ -170,3 +171,29 @@ def test_qwen35_hydra_config_composes_for_eval() -> None:
     assert cfg.llm.vllm_server.max_model_len == 16384
     assert cfg.llm.vllm_server.max_tries == 900
     assert cfg.llm.vllm_server.modern_cli is True
+
+
+def test_qwen35_lora_config_composes_for_direct_adapter_eval() -> None:
+    cfg = get_config(
+        "eval",
+        [
+            "llm=qwen_3_5_4b_lora32_eval",
+            "experiment_name=qwen35_lora_config_test",
+        ],
+    )
+
+    assert cfg.llm.vllm_server.enable_lora is True
+    assert cfg.llm.vllm_server.max_lora_rank == 32
+    assert cfg.llm.lora_rank == 32
+    assert cfg.llm.vllm_class.enable_thinking is False
+
+
+def test_direct_adapter_path_is_not_rewritten_as_checkpoint(tmp_path) -> None:
+    adapter = tmp_path / "final_adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+
+    assert _is_adapter_directory(adapter)
+    assert lora_path(adapter) == adapter
+    assert lora_path(tmp_path / "checkpoint-1") == tmp_path / "checkpoint-1" / "lora"

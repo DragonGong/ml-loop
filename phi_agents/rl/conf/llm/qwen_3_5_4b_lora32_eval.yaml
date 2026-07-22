@@ -1,0 +1,11 @@
+defaults:
+  - qwen_3_5_4b_eval
+  - _self_
+
+vllm_server:
+  enable_lora: true
+  max_lora_rank: 32
+
+lora_rank: 32
+lora_alpha: 64
+lora_dropout: 0.05

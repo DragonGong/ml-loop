@@ -12,6 +12,7 @@ from phi_agents.sft.trainer import (
     AssistantOnlyCollator,
     SFTConfig,
     TokenizedSFTDataset,
+    token_normalized_trainer_class,
     train,
     training_schedule_preflight,
 )
@@ -198,11 +199,11 @@ def _one_update(
     batch_size: int,
     accumulation: int,
 ) -> tuple[float, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    from transformers import Trainer, TrainingArguments
+    from transformers import TrainingArguments
 
     model = _tiny_model(initial_state)
     capture = _gradient_capture()
-    trainer = Trainer(
+    trainer = token_normalized_trainer_class()(
         model=model,
         args=TrainingArguments(
             output_dir=str(tmp_path),
@@ -348,6 +349,8 @@ def test_tiny_sft_train_backward_and_checkpoint_smoke(tmp_path: Path, monkeypatc
         config.to_json_file(tiny_base / "config.json")
         return Qwen2ForCausalLM(config)
 
+    tiny_model()
+
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
     monkeypatch.setattr(
         AutoModelForCausalLM,
@@ -365,6 +368,7 @@ def test_tiny_sft_train_backward_and_checkpoint_smoke(tmp_path: Path, monkeypatc
             validation_jsonl=validation_path,
             output_dir=output_dir,
             model_name="tiny-qwen2",
+            model_path=tiny_base,
             max_length=256,
             lora_rank=2,
             lora_alpha=4,

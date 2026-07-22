@@ -554,5 +554,6 @@ def lora_path(checkpoint_dir: Path | None) -> Path | None:
     """LoRA weights path relative to the checkpoint dir."""
     if checkpoint_dir is None:
         return None
-    else:
-        return checkpoint_dir / "lora"
+    if (checkpoint_dir / "adapter_config.json").is_file():
+        return checkpoint_dir
+    return checkpoint_dir / "lora"

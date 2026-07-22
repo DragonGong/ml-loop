@@ -203,6 +203,14 @@ def _is_complete_checkpoint(path: Path) -> bool:
     return has_trainer_state and has_lora
 
 
+def _is_adapter_directory(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and (path / "adapter_config.json").is_file()
+        and (path / "adapter_model.safetensors").is_file()
+    )
+
+
 def _summary_paths(summary_dir: Path) -> dict[str, Path]:
     return {
         "json": summary_dir / "summary.json",
@@ -475,6 +483,8 @@ def _write_run_config(args: argparse.Namespace) -> None:
         "split": args.split,
         "run_name": args.run_name,
         "checkpoint_root": str(args.checkpoint_root) if args.checkpoint_root else None,
+        "adapter_path": str(args.adapter_path) if args.adapter_path else None,
+        "checkpoint_name": args.checkpoint_name,
         "summary_dir": str(args.summary_dir),
         "cuda_visible_devices": args.cuda_visible_devices,
         "num_scenario_runners": args.num_scenario_runners,
@@ -840,7 +850,9 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("base", "checkpoint", "watch"), default="watch")
+    parser.add_argument(
+        "--mode", choices=("base", "checkpoint", "adapter", "watch"), default="watch"
+    )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument(
         "--appworld-root",
@@ -849,6 +861,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-root", type=Path, default=None)
     parser.add_argument("--checkpoint-path", type=Path, default=None)
+    parser.add_argument("--adapter-path", type=Path, default=None)
+    parser.add_argument("--checkpoint-name", default=None)
     parser.add_argument("--run-name", default="qwen25_7b_loop_200x24x6_lora16")
     parser.add_argument(
         "--summary-dir", type=Path, default=Path("artifacts/loop7b_stage2_dev_eval")
@@ -903,6 +917,39 @@ def main() -> None:
             checkpoint_name=args.checkpoint_path.name,
             checkpoint_iteration=_checkpoint_iteration(args.checkpoint_path),
         )
+    elif args.mode == "adapter":
+        if args.adapter_path is None:
+            raise ValueError("--adapter-path is required for --mode adapter")
+        if not args.checkpoint_name:
+            raise ValueError("--checkpoint-name is required for --mode adapter")
+        if not _is_adapter_directory(args.adapter_path):
+            raise ValueError(f"Adapter appears incomplete: {args.adapter_path}")
+        try:
+            _run_repeats(
+                args,
+                adapter_path=str(args.adapter_path),
+                checkpoint_name=args.checkpoint_name,
+                checkpoint_iteration=None,
+            )
+        except subprocess.CalledProcessError as exc:
+            log_path = _log_path_for_eval(
+                args,
+                checkpoint_name=args.checkpoint_name,
+                checkpoint_iteration=None,
+                repeat_index=0,
+            )
+            retryable, reason = _classify_failure(log_path, exc)
+            _record_eval_failure(
+                args,
+                checkpoint_name=args.checkpoint_name,
+                checkpoint_iteration=None,
+                repeat_index=0,
+                log_path=log_path,
+                reason=reason,
+                retryable=retryable,
+                return_code=exc.returncode,
+            )
+            raise
     else:
         if args.checkpoint_root is None:
             raise ValueError("--checkpoint-root is required for --mode watch")

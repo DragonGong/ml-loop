@@ -21,7 +21,7 @@ from phi_agents.utils.logger import get_phi_logger
 
 logger = get_phi_logger()
 
-LORA_TARGET_MODULES = [
+QWEN2_LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
     "v_proj",
@@ -30,6 +30,33 @@ LORA_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
+
+QWEN35_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+# Backward-compatible import used by older tests and experiment tooling.
+LORA_TARGET_MODULES = QWEN2_LORA_TARGET_MODULES
+
+
+@dataclass(frozen=True)
+class SFTModelProfile:
+    model_type: str
+    lora_target_modules: tuple[str, ...]
+    image_text_model: bool = False
+    sparse_assistant_logits_supported: bool = False
+    fsdp_transformer_layer_cls: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,19 +89,28 @@ class SFTConfig:
     logging_steps: int = 5
     save_steps: int = 50
     eval_steps: int = 50
+    save_strategy: str = "epoch"
+    save_total_limit: int = 3
     seed: int = 20_260_713
     resume_from_checkpoint: str | None = None
     initial_adapter: Path | None = None
     max_steps: int = -1
     max_train_samples: int | None = None
     max_validation_samples: int | None = None
+    sparse_assistant_logits: bool = False
+    fsdp_full_shard: bool = False
+    fsdp_cpu_offload: bool = False
     use_cpu: bool = False
 
 
 def training_schedule_preflight(config: SFTConfig, train_windows: int) -> dict[str, int | float]:
     if train_windows < 1:
         raise ValueError("At least one training window is required")
-    micro_batches_per_epoch = math.ceil(train_windows / config.per_device_train_batch_size)
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    samples_per_process = math.ceil(train_windows / world_size)
+    micro_batches_per_epoch = math.ceil(
+        samples_per_process / config.per_device_train_batch_size
+    )
     optimizer_steps_per_epoch = math.ceil(
         micro_batches_per_epoch / config.gradient_accumulation_steps
     )
@@ -87,6 +123,13 @@ def training_schedule_preflight(config: SFTConfig, train_windows: int) -> dict[s
     return {
         "train_windows": train_windows,
         "epochs": config.epochs,
+        "world_size": world_size,
+        "samples_per_process": samples_per_process,
+        "global_batch_size": (
+            config.per_device_train_batch_size
+            * world_size
+            * config.gradient_accumulation_steps
+        ),
         "micro_batches_per_epoch": micro_batches_per_epoch,
         "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
         "expected_optimizer_steps": scheduler_total_steps,
@@ -125,6 +168,56 @@ def _attention_backend(config: SFTConfig) -> str:
     return "sdpa"
 
 
+def model_profile(model_source: str | Path) -> SFTModelProfile:
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained(model_source)
+    if model_config.model_type == "qwen3_5":
+        return SFTModelProfile(
+            model_type="qwen3_5",
+            lora_target_modules=tuple(QWEN35_LORA_TARGET_MODULES),
+            image_text_model=True,
+            sparse_assistant_logits_supported=True,
+            fsdp_transformer_layer_cls="Qwen3_5DecoderLayer",
+        )
+    return SFTModelProfile(
+        model_type=str(model_config.model_type),
+        lora_target_modules=tuple(QWEN2_LORA_TARGET_MODULES),
+    )
+
+
+def _render_chat(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
+    template_kwargs: dict[str, Any] = {}
+    if "enable_thinking" in str(getattr(tokenizer, "chat_template", "") or ""):
+        template_kwargs["enable_thinking"] = False
+    return str(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+    )
+
+
+def _content_span(rendered: str, content: str, cursor: int) -> tuple[int, int]:
+    if not content:
+        return cursor, cursor
+    start = rendered.find(content, cursor)
+    if start >= 0:
+        return start, start + len(content)
+
+    # Qwen3.5 trims every rendered message. Preserve exact matching for older
+    # templates, then use the template-normalized form only when necessary.
+    normalized = content.strip()
+    if not normalized:
+        return cursor, cursor
+    start = rendered.find(normalized, cursor)
+    if start < 0:
+        raise ValueError("Message content was not preserved by the Qwen chat template")
+    return start, start + len(normalized)
+
+
 def tokenize_messages(
     tokenizer: Any,
     messages: list[dict[str, Any]],
@@ -133,9 +226,7 @@ def tokenize_messages(
 ) -> dict[str, Any]:
     """Tokenize Qwen chat messages and label only visible trainable assistant content."""
     chat_messages = [{"role": row["role"], "content": row["content"]} for row in messages]
-    rendered = tokenizer.apply_chat_template(
-        chat_messages, tokenize=False, add_generation_prompt=False
-    )
+    rendered = _render_chat(tokenizer, chat_messages)
     encoded = tokenizer(
         rendered,
         add_special_tokens=False,
@@ -149,10 +240,7 @@ def tokenize_messages(
     cursor = 0
     for message_index, message in enumerate(messages):
         content = str(message["content"])
-        start = rendered.find(content, cursor)
-        if start < 0:
-            raise ValueError("Message content was not preserved by the Qwen chat template")
-        end = start + len(content)
+        start, end = _content_span(rendered, content, cursor)
         cursor = end
         token_indices = [
             idx
@@ -162,6 +250,8 @@ def tokenize_messages(
         if message.get("loss") is True:
             if message["role"] != "assistant":
                 raise ValueError("Only assistant messages may have loss=true")
+            if not token_indices:
+                raise ValueError("A supervised assistant message rendered to zero tokens")
             for idx in token_indices:
                 labels[idx] = input_ids[idx]
         if message["role"] == "assistant" and message.get("step_id") is not None:
@@ -292,7 +382,8 @@ def _window_messages(
         return render([])
 
     earliest = 0 if turn_overlap <= 0 else max(0, target_start - turn_overlap)
-    for history_start in range(earliest, target_start):
+
+    def render_from(history_start: int) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
         history = [
             {
                 **message,
@@ -303,9 +394,24 @@ def _window_messages(
             for turn in turns[history_start:target_start]
             for message in turn
         ]
-        rendered = render(history)
-        if rendered is not None:
-            return rendered
+        return render(history)
+
+    # Removing older complete turns can only shorten a rendered Qwen chat. Find
+    # the earliest history boundary that fits without repeatedly tokenizing all
+    # intermediate candidates.
+    low = earliest
+    high = target_start - 1
+    best_history: tuple[list[dict[str, Any]], dict[str, Any]] | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        rendered = render_from(middle)
+        if rendered is None:
+            low = middle + 1
+        else:
+            best_history = rendered
+            high = middle - 1
+    if best_history is not None:
+        return best_history
 
     previous_observations = [
         {
@@ -333,27 +439,36 @@ def window_sample(
     """Split targets once while retaining maximal masked history at complete boundaries."""
     normalized, _ = _normalize_sample_steps(sample)
     prompt, turns = _prompt_and_turns(normalized["messages"])
-    for turn_index, turn in enumerate(turns):
-        single_turn = tokenize_messages(tokenizer, prompt + turn, require_supervision=False)
-        if len(single_turn["input_ids"]) > max_length:
-            step_id = turn[0].get("step_id", turn_index)
-            raise ValueError(
-                f"One complete prompt+turn exceeds max_length={max_length}: "
-                f"turn={turn_index}, step_id={step_id}"
-            )
     windows: list[dict[str, Any]] = []
     start = 0
     while start < len(turns):
         best_end: int | None = None
         best_messages: list[dict[str, Any]] | None = None
         best_tokens: dict[str, Any] | None = None
-        for end in range(start + 1, len(turns) + 1):
+        first_supervised_end = next(
+            (
+                end
+                for end in range(start + 1, len(turns) + 1)
+                if any(
+                    message.get("loss") is True
+                    for turn in turns[start:end]
+                    for message in turn
+                    if message.get("role") == "assistant"
+                )
+            ),
+            None,
+        )
+        low = first_supervised_end or len(turns) + 1
+        high = len(turns)
+        while low <= high:
+            end = (low + high) // 2
             if not any(
                 message.get("loss") is True
                 for turn in turns[start:end]
                 for message in turn
                 if message.get("role") == "assistant"
             ):
+                low = end + 1
                 continue
             rendered = _window_messages(
                 tokenizer,
@@ -366,10 +481,21 @@ def window_sample(
                 preserve_history,
             )
             if rendered is None:
-                break
-            best_messages, best_tokens = rendered
-            best_end = end
+                high = end - 1
+            else:
+                best_messages, best_tokens = rendered
+                best_end = end
+                low = end + 1
         if best_end is None or best_tokens is None or best_messages is None:
+            single_turn = tokenize_messages(
+                tokenizer, prompt + turns[start], require_supervision=False
+            )
+            if len(single_turn["input_ids"]) > max_length:
+                step_id = turns[start][0].get("step_id", start)
+                raise ValueError(
+                    f"One complete prompt+turn exceeds max_length={max_length}: "
+                    f"turn={start}, step_id={step_id}"
+                )
             raise ValueError(
                 f"No complete supervised target range starting at turn {start} fits "
                 f"max_length={max_length} with its required preceding observation"
@@ -428,6 +554,140 @@ class AssistantOnlyCollator:
             )
             batch["labels"].append(torch.nn.functional.pad(row["labels"], (0, padding), value=-100))
         return {key: torch.stack(values) for key, values in batch.items()}
+
+
+def sparse_assistant_causal_loss(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    num_items_in_batch: torch.Tensor | int | None = None,
+) -> tuple[torch.Tensor, Any]:
+    """Compute causal loss without materializing logits for masked prompt tokens."""
+    labels = inputs["labels"]
+    if labels.ndim != 2 or labels.shape[0] != 1:
+        raise ValueError("Sparse assistant logits require per-device batch size 1")
+
+    shifted_labels = labels[:, 1:]
+    supervised = shifted_labels.ne(-100)
+    prediction_positions = supervised[0].nonzero(as_tuple=False).flatten()
+    if prediction_positions.numel() == 0:
+        raise ValueError("SFT batch has no supervised causal targets")
+    targets = shifted_labels[0, prediction_positions]
+    model_inputs = {key: value for key, value in inputs.items() if key != "labels"}
+    outputs = model(
+        **model_inputs,
+        use_cache=False,
+        logits_to_keep=prediction_positions,
+    )
+    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+    if logits.shape[:2] != (1, prediction_positions.numel()):
+        raise RuntimeError(
+            "Model did not honor logits_to_keep: "
+            f"logits_shape={tuple(logits.shape)} positions={prediction_positions.numel()}"
+        )
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        targets.reshape(-1),
+        reduction="sum",
+    )
+    denominator = (
+        torch.as_tensor(num_items_in_batch, device=loss.device, dtype=loss.dtype)
+        if num_items_in_batch is not None
+        else loss.new_tensor(targets.numel())
+    )
+    if denominator.item() <= 0:
+        raise ValueError("num_items_in_batch must be positive")
+    return loss / denominator, outputs
+
+
+def sparse_assistant_trainer_class() -> type[Any]:
+    from transformers import Trainer
+
+    class SparseAssistantLogitsTrainer(Trainer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            # This makes Trainer count supervised labels across each gradient
+            # accumulation group and pass the global denominator here.
+            self.model_accepts_loss_kwargs = True
+
+        def compute_loss(
+            self,
+            model: torch.nn.Module,
+            inputs: dict[str, torch.Tensor],
+            return_outputs: bool = False,
+            num_items_in_batch: torch.Tensor | int | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+            loss, outputs = sparse_assistant_causal_loss(
+                model,
+                inputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+            if (
+                self.args.average_tokens_across_devices
+                and num_items_in_batch is not None
+            ):
+                loss = loss * self.accelerator.num_processes
+            if model.training and num_items_in_batch is not None:
+                # Accelerate.backward divides every micro-batch loss by the
+                # accumulation factor. The denominator above already spans the
+                # whole accumulation group, so compensate before backward.
+                loss = loss * self.current_gradient_accumulation_steps
+            return (loss, outputs) if return_outputs else loss
+
+        def training_step(
+            self,
+            model: torch.nn.Module,
+            inputs: dict[str, Any],
+            num_items_in_batch: torch.Tensor | int | None = None,
+        ) -> torch.Tensor:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            if num_items_in_batch is not None:
+                loss = loss / self.current_gradient_accumulation_steps
+            return loss
+
+    return SparseAssistantLogitsTrainer
+
+
+def token_normalized_trainer_class() -> type[Any]:
+    from transformers import Trainer
+
+    class TokenNormalizedTrainer(Trainer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.model_accepts_loss_kwargs = True
+
+        def compute_loss(
+            self,
+            model: torch.nn.Module,
+            inputs: dict[str, torch.Tensor],
+            return_outputs: bool = False,
+            num_items_in_batch: torch.Tensor | int | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+            result = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+            if return_outputs:
+                loss, outputs = result
+            else:
+                loss, outputs = result, None
+            if model.training and num_items_in_batch is not None:
+                loss = loss * self.current_gradient_accumulation_steps
+            return (loss, outputs) if return_outputs else loss
+
+        def training_step(
+            self,
+            model: torch.nn.Module,
+            inputs: dict[str, Any],
+            num_items_in_batch: torch.Tensor | int | None = None,
+        ) -> torch.Tensor:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            if num_items_in_batch is not None:
+                loss = loss / self.current_gradient_accumulation_steps
+            return loss
+
+    return TokenNormalizedTrainer
 
 
 def audit_sample_windows(
@@ -521,6 +781,26 @@ def artifact_manifest_callback(manifest: dict[str, Any]) -> Any:
     from transformers import TrainerCallback
 
     class ArtifactManifestCallback(TrainerCallback):
+        def on_step_end(
+            self, args: Any, state: Any, control: Any, **kwargs: Any
+        ) -> Any:
+            del args, kwargs
+            save_steps = int(manifest["sft_config"]["save_steps"])
+            if (
+                manifest["sft_config"]["save_strategy"] == "steps"
+                and save_steps > 0
+                and state.global_step % save_steps == 0
+            ):
+                control.should_save = True
+            return control
+
+        def on_epoch_end(
+            self, args: Any, state: Any, control: Any, **kwargs: Any
+        ) -> Any:
+            del args, state, kwargs
+            control.should_save = True
+            return control
+
         def on_log(
             self,
             args: Any,
@@ -548,6 +828,9 @@ def artifact_manifest_callback(manifest: dict[str, Any]) -> Any:
                 )
 
         def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            del control, kwargs
+            if not state.is_world_process_zero:
+                return
             checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
             checkpoint_manifest = {
                 **manifest,
@@ -571,11 +854,35 @@ def artifact_manifest_callback(manifest: dict[str, Any]) -> Any:
                 if source.is_file():
                     shutil.copy2(source, lora_dir / filename)
             if state.epoch is not None and abs(state.epoch - round(state.epoch)) < 1e-6:
-                epoch_link = Path(args.output_dir) / f"epoch-{round(state.epoch)}"
+                epoch_number = round(state.epoch)
+                epoch_link = Path(args.output_dir) / f"epoch-{epoch_number}"
                 if epoch_link.is_symlink():
                     epoch_link.unlink()
                 if not epoch_link.exists():
-                    epoch_link.symlink_to(checkpoint.name, target_is_directory=True)
+                    try:
+                        epoch_link.symlink_to(checkpoint.name, target_is_directory=True)
+                    except OSError:
+                        logger.warning(
+                            "Could not create epoch checkpoint symlink %s; using JSON pointer.",
+                            epoch_link,
+                            extra={"event": "training_epoch_symlink_failed"},
+                        )
+                (Path(args.output_dir) / f"epoch-{epoch_number}.json").write_text(
+                    json.dumps(
+                        {
+                            "epoch": epoch_number,
+                            "global_step": state.global_step,
+                            "checkpoint": str(checkpoint.resolve()),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            (checkpoint / "done.txt").write_text(
+                f"global_step={state.global_step}\nepoch={state.epoch}\n"
+            )
+            (checkpoint / ".complete").write_text("complete\n")
             logger.info(
                 "SFT checkpoint saved (step=%s, epoch=%s)",
                 state.global_step,
@@ -664,6 +971,10 @@ def prepare_windows(
         "effective_supervised_tokens": combined_audit["effective_supervised_tokens"],
         "masked_assistant_tokens": combined_audit["masked_assistant_tokens"],
         "total_tokens": sum(len(row["input_ids"]) for row in train),
+        "max_train_window_tokens": max((len(row["input_ids"]) for row in train), default=0),
+        "max_validation_window_tokens": max(
+            (len(row["input_ids"]) for row in validation), default=0
+        ),
         "trajectory_split_ratio": (
             (train_split_count + validation_split_count) / trajectory_count
             if trajectory_count
@@ -687,6 +998,16 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         extra={"event": "training_data_preparation_started"},
     )
     model_source = str(config.model_path or config.model_name)
+    profile = model_profile(model_source)
+    if config.sparse_assistant_logits:
+        if not profile.sparse_assistant_logits_supported:
+            raise ValueError(
+                f"Sparse assistant logits are not supported for model_type={profile.model_type}"
+            )
+        if config.per_device_train_batch_size != 1 or config.per_device_eval_batch_size != 1:
+            raise ValueError("Sparse assistant logits require per-device batch size 1")
+    if config.fsdp_full_shard and int(os.environ.get("WORLD_SIZE", "1")) < 2:
+        raise ValueError("FSDP full-shard requires WORLD_SIZE >= 2")
     tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -707,16 +1028,18 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         "base_model": config.model_name,
         "base_model_path": str(config.model_path.resolve()) if config.model_path else None,
         "adapter_kind": "lora",
+        "model_type": profile.model_type,
         "initial_adapter_sha256": _directory_digest(config.initial_adapter),
         "attention_backend": selected_attention_backend,
         "packing": False,
-        "lora_target_modules": LORA_TARGET_MODULES,
+        "lora_target_modules": list(profile.lora_target_modules),
         "loop_compatible": True,
         "schedule_preflight": schedule,
     }
-    (config.output_dir / "sft_artifact.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    )
+    if int(os.environ.get("RANK", "0")) == 0:
+        (config.output_dir / "sft_artifact.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
     logger.info(
         "AppWorld SFT supervision audit passed "
         "(train_windows=%s, validation_windows=%s, supervised_tokens=%s, legacy_samples=%s)",
@@ -742,35 +1065,41 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         return manifest
 
     from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-    from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        TrainingArguments,
+    )
 
     model_kwargs = {
         "dtype": torch.bfloat16 if config.bf16 else torch.float32,
         "attn_implementation": selected_attention_backend,
     }
+    model_loader = AutoModelForImageTextToText if profile.image_text_model else AutoModelForCausalLM
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_source, **model_kwargs)
+        model = model_loader.from_pretrained(model_source, **model_kwargs)
     except (ImportError, RuntimeError, ValueError):
         if selected_attention_backend != "flash_attention_2":
             raise
         selected_attention_backend = "sdpa"
         model_kwargs["attn_implementation"] = selected_attention_backend
         manifest["attention_backend"] = selected_attention_backend
-        (config.output_dir / "sft_artifact.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            (config.output_dir / "sft_artifact.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
         logger.warning(
             "Flash Attention 2 was unavailable; falling back to SDPA.",
             extra={"event": "attention_backend_fallback"},
         )
-        model = AutoModelForCausalLM.from_pretrained(model_source, **model_kwargs)
+        model = model_loader.from_pretrained(model_source, **model_kwargs)
     if config.initial_adapter is None:
         lora = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=config.lora_rank,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
-            target_modules=LORA_TARGET_MODULES,
+            target_modules=list(profile.lora_target_modules),
             bias="none",
         )
         model = get_peft_model(model, lora)
@@ -778,18 +1107,63 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         model = PeftModel.from_pretrained(model, config.initial_adapter, is_trainable=True)
     if config.gradient_checkpointing:
         model.enable_input_require_grads()
-        model.config.use_cache = False
+        for model_config in (
+            model.config,
+            getattr(model.config, "text_config", None),
+            getattr(getattr(model, "get_decoder", lambda: None)(), "config", None),
+        ):
+            if model_config is not None:
+                model_config.use_cache = False
     if any(
         parameter.requires_grad
         for name, parameter in model.named_parameters()
         if "lora_" not in name
     ):
         raise RuntimeError("A non-LoRA model parameter is unexpectedly trainable")
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    if (
+        profile.model_type == "qwen3_5"
+        and config.lora_rank == 32
+        and config.initial_adapter is None
+        and trainable_parameters != 64_929_792
+    ):
+        raise RuntimeError(
+            "Unexpected Qwen3.5 rank-32 LoRA parameter count: "
+            f"actual={trainable_parameters} expected=64929792"
+        )
+    manifest["trainable_parameters"] = trainable_parameters
+    if int(os.environ.get("RANK", "0")) == 0:
+        (config.output_dir / "sft_artifact.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
 
     enable_tf32 = config.tf32 and torch.cuda.is_available() and not config.use_cpu
     if torch.cuda.is_available() and not config.use_cpu:
         torch.backends.cuda.matmul.allow_tf32 = enable_tf32
         torch.backends.cudnn.allow_tf32 = enable_tf32
+
+    fsdp_options: str | None = None
+    fsdp_config: dict[str, Any] | None = None
+    if config.fsdp_full_shard:
+        if profile.fsdp_transformer_layer_cls is None:
+            raise ValueError(
+                f"No FSDP transformer layer is configured for model_type={profile.model_type}"
+            )
+        fsdp_options = "full_shard auto_wrap"
+        if config.fsdp_cpu_offload:
+            fsdp_options += " offload"
+        fsdp_config = {
+            "transformer_layer_cls_to_wrap": [profile.fsdp_transformer_layer_cls],
+            "use_orig_params": True,
+            # Every rank loads the same local safetensors. Broadcasting the full
+            # 5.17B BF16 model before sharding creates a needless 10+ GiB peak.
+            "sync_module_states": False,
+            "forward_prefetch": False,
+            "backward_prefetch": "BACKWARD_PRE",
+            "limit_all_gathers": True,
+        }
 
     arguments = TrainingArguments(
         output_dir=str(config.output_dir),
@@ -812,15 +1186,26 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
         save_steps=config.save_steps,
         eval_steps=config.eval_steps,
         eval_strategy="epoch" if validation_rows else "no",
-        save_strategy="epoch",
-        save_total_limit=3,
+        save_strategy=config.save_strategy,
+        save_total_limit=config.save_total_limit,
+        prediction_loss_only=config.sparse_assistant_logits,
         report_to="wandb" if os.environ.get("WANDB_PROJECT") else "none",
         seed=config.seed,
         data_seed=config.seed,
         remove_unused_columns=False,
+        ddp_find_unused_parameters=False,
+        fsdp=fsdp_options,
+        fsdp_config=fsdp_config,
+        average_tokens_across_devices=True,
+        use_cache=False,
         use_cpu=config.use_cpu,
     )
-    trainer = Trainer(
+    trainer_class = (
+        sparse_assistant_trainer_class()
+        if config.sparse_assistant_logits
+        else token_normalized_trainer_class()
+    )
+    trainer = trainer_class(
         model=model,
         args=arguments,
         train_dataset=TokenizedSFTDataset(train_rows),
@@ -853,8 +1238,16 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
     )
     if validation_rows and not eval_metrics:
         eval_metrics = trainer.evaluate()
-    trainer.save_model(str(config.output_dir / "final_adapter"))
-    trainer.save_model(str(config.output_dir / "lora"))
+    final_adapter = config.output_dir / "final_adapter"
+    trainer.save_model(str(final_adapter))
+    trainer.accelerator.wait_for_everyone()
+    if trainer.is_world_process_zero():
+        lora_dir = config.output_dir / "lora"
+        lora_dir.mkdir(exist_ok=True)
+        for filename in ("adapter_config.json", "adapter_model.safetensors", "README.md"):
+            source = final_adapter / filename
+            if source.is_file():
+                shutil.copy2(source, lora_dir / filename)
     trainer.save_state()
     metrics = {**result.metrics, **eval_metrics, **stats}
     runtime = float(result.metrics.get("train_runtime") or 0.0)
@@ -885,9 +1278,10 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
     metrics["train_tokens_per_second"] = (
         stats["total_tokens"] * completed_epochs / runtime if runtime else 0.0
     )
-    (config.output_dir / "train_metrics.json").write_text(
-        json.dumps(metrics, indent=2, sort_keys=True) + "\n"
-    )
+    if trainer.is_world_process_zero():
+        (config.output_dir / "train_metrics.json").write_text(
+            json.dumps(metrics, indent=2, sort_keys=True) + "\n"
+        )
     logger.info(
         "AppWorld LoRA SFT completed "
         "(optimizer_steps=%s, train_loss=%s, validation_loss=%s, runtime_seconds=%s)",
@@ -901,7 +1295,7 @@ def train(config: SFTConfig, tokenize_only: bool = False) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LoRA SFT for Qwen2.5-7B AppWorld actions.")
+    parser = argparse.ArgumentParser(description="LoRA SFT for AppWorld action models.")
     parser.add_argument("--train-jsonl", type=Path, required=True)
     parser.add_argument("--validation-jsonl", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -921,6 +1315,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=float, default=2.0)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
@@ -934,12 +1330,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20_260_713)
     parser.add_argument("--logging-steps", type=int, default=5)
+    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--eval-steps", type=int, default=50)
+    parser.add_argument("--save-strategy", choices=("epoch", "steps"), default="epoch")
+    parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument("--initial-adapter", type=Path)
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-validation-samples", type=int)
     parser.add_argument("--disable-tf32", action="store_true")
+    parser.add_argument("--sparse-assistant-logits", action="store_true")
+    parser.add_argument("--fsdp-full-shard", action="store_true")
+    parser.add_argument("--fsdp-cpu-offload", action="store_true")
     parser.add_argument("--tokenize-only", action="store_true")
     parser.add_argument("--use-cpu", action="store_true")
     return parser.parse_args()
@@ -984,6 +1387,8 @@ def main() -> None:
         lora_dropout=args.lora_dropout,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         tf32=not args.disable_tf32,
         weight_decay=args.weight_decay,
@@ -993,11 +1398,18 @@ def main() -> None:
         attention_backend=args.attention_backend,
         seed=args.seed,
         logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
+        save_strategy=args.save_strategy,
+        save_total_limit=args.save_total_limit,
         resume_from_checkpoint=args.resume_from_checkpoint,
         initial_adapter=args.initial_adapter,
         max_steps=args.max_steps,
         max_train_samples=args.max_train_samples,
         max_validation_samples=args.max_validation_samples,
+        sparse_assistant_logits=args.sparse_assistant_logits,
+        fsdp_full_shard=args.fsdp_full_shard,
+        fsdp_cpu_offload=args.fsdp_cpu_offload,
         use_cpu=args.use_cpu,
     )
     previous_handlers = _install_termination_handlers()
