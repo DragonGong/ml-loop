@@ -138,6 +138,18 @@ def test_vllm_server_passes_qwen35_text_only_and_cache_flags(monkeypatch) -> Non
     assert isinstance(env, dict)
     assert env["CUDA_VISIBLE_DEVICES"] == "1"
     assert env["VLLM_NO_USAGE_STATS"] == "1"
+    assert env["VLLM_PORT"] == str(vllm_server._vllm_internal_port_base(8123))
+
+
+def test_concurrent_vllm_servers_get_disjoint_internal_port_blocks() -> None:
+    bases = [
+        vllm_server._vllm_internal_port_base(port)
+        for port in (5555, 5557, 5559, 5561)
+    ]
+
+    assert len(set(bases)) == 4
+    assert all(30_000 <= base <= 61_936 for base in bases)
+    assert min(abs(left - right) for left in bases for right in bases if left != right) >= 64
 
 
 def test_qwen35_base_experiment_name_uses_run_name() -> None:

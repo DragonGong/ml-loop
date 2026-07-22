@@ -29,6 +29,15 @@ if TYPE_CHECKING:
 logger = get_phi_logger()
 
 LORA_MODEL_ID = "phi_lora_model"
+_VLLM_INTERNAL_PORT_MIN = 30_000
+_VLLM_INTERNAL_PORT_BLOCK_SIZE = 64
+_VLLM_INTERNAL_PORT_SLOTS = 500
+
+
+def _vllm_internal_port_base(server_port: int) -> int:
+    """Give concurrent vLLM servers disjoint internal port ranges."""
+    slot = server_port % _VLLM_INTERNAL_PORT_SLOTS
+    return _VLLM_INTERNAL_PORT_MIN + slot * _VLLM_INTERNAL_PORT_BLOCK_SIZE
 
 
 @dataclass(frozen=True)
@@ -223,6 +232,7 @@ class VLLMServer:
         env["VLLM_SERVER_DEV_MODE"] = "1"
 
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        env["VLLM_PORT"] = str(_vllm_internal_port_base(self._port))
 
         # limit to certain GPUs
         if self._cuda_visible_devices is not None:
