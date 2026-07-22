@@ -510,7 +510,7 @@ def _experiment_name(
 ) -> str:
     suffix = f"_r{repeat_index}" if args.repeat > 1 else ""
     if checkpoint_name == "base":
-        return _sanitize(f"eval_base_qwen25_7b_{args.split}_stage2{suffix}")
+        return _sanitize(f"eval_{args.run_name}_base_{args.split}{suffix}")
     iteration_text = f"ckpt{iteration}" if iteration is not None else checkpoint_name
     return _sanitize(f"eval_{args.run_name}_{iteration_text}_{args.split}{suffix}")
 

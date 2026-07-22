@@ -170,6 +170,10 @@ class VLLMServer:
         torch_dtype: str = "bfloat16"
         eager_mode: bool = False
         allow_connect_to_existing: bool = True
+        language_model_only: bool = False
+        kv_cache_memory_bytes: str | None = None
+        max_num_seqs: int | None = None
+        modern_cli: bool = False
 
     def __init__(
         self,
@@ -211,7 +215,7 @@ class VLLMServer:
 
         # turn off telemetry
         # https://docs.vllm.ai/en/latest/serving/usage_stats.html
-        env["VLLM_NO_USAGE_STATS"] = "0"
+        env["VLLM_NO_USAGE_STATS"] = "1"
 
         env["VLLM_LOGGING_LEVEL"] = "INFO"
 
@@ -239,12 +243,17 @@ class VLLMServer:
         args = [
             str(executable),
             "serve",
-            "--disable-log-requests",
             "--port",
             str(self._port),
             self._base_model_path.as_posix(),
             "--return-tokens-as-token-ids",
         ]
+
+        modern_cli = getattr(self._conf, "modern_cli", False)
+        if modern_cli:
+            args.append("--no-enable-log-requests")
+        else:
+            args.append("--disable-log-requests")
 
         if cuda_architecture <= cuda_arc_to_major["volta"]:
             args.append("--dtype=half")
@@ -254,6 +263,9 @@ class VLLMServer:
         if self._conf.enable_lora:
             # https://docs.vllm.ai/en/latest/models/lora.html#serving-lora-adapters
             args.extend(["--enable-lora"])
+
+        if getattr(self._conf, "language_model_only", False):
+            args.append("--language-model-only")
 
         max_capture_length = 32768
         if self._conf.max_model_len is not None:
@@ -273,7 +285,19 @@ class VLLMServer:
         if self._max_gpu_mem_utilization is not None:
             args.append(f"--gpu-memory-utilization={self._max_gpu_mem_utilization:0.2f}")
 
-        if hasattr(self._conf, "max_lora_rank") and self._conf.max_lora_rank is not None:
+        kv_cache_memory_bytes = getattr(self._conf, "kv_cache_memory_bytes", None)
+        if kv_cache_memory_bytes is not None:
+            args.extend(["--kv-cache-memory-bytes", str(kv_cache_memory_bytes)])
+
+        max_num_seqs = getattr(self._conf, "max_num_seqs", None)
+        if max_num_seqs is not None:
+            args.extend(["--max-num-seqs", str(max_num_seqs)])
+
+        if (
+            self._conf.enable_lora
+            and hasattr(self._conf, "max_lora_rank")
+            and self._conf.max_lora_rank is not None
+        ):
             args.append(f"--max-lora-rank={self._conf.max_lora_rank}")
 
         # vLLM defaults to seed 0, we either use a random seed or specific one if requested.
@@ -299,12 +323,17 @@ class VLLMServer:
 
         args.extend(
             [
-                "--swap-space=16",
                 "--disable-sliding-window",
                 "--disable-cascade-attn",  # this apparently causes some issues on p4de if not disabled?
-                f"--max-seq-len-to-capture={max_capture_length}",  # by @jackson
             ]
         )
+        if not modern_cli:
+            args.extend(
+                [
+                    "--swap-space=16",
+                    f"--max-seq-len-to-capture={max_capture_length}",  # by @jackson
+                ]
+            )
 
         args.append("--generation-config=vllm")
         # --override-generation-config should not be necessary, --generation-config=vllm already wipes out model-specific settings in generation_config.json

@@ -1,0 +1,31 @@
+defaults:
+  - qwen_2_5_7b_eval
+  - _self_
+
+parameter_count: 4b
+base_model_path: Qwen/Qwen3.5-4B
+adapter_path: null
+max_gpu_mem_utilization: 0.82
+temperature: 0.1
+
+vllm_server:
+  max_model_len: 16_384
+  max_tries: 900
+  enable_lora: false
+  enable_prefix_caching: true
+  gpus_per_vllm_server: 1
+  eager_mode: false
+  allow_connect_to_existing: false
+  language_model_only: true
+  kv_cache_memory_bytes: null
+  max_num_seqs: 8
+  modern_cli: true
+
+vllm_class:
+  _target_: phi_agents.rl.llm.VLLMQwen3
+  max_new_tokens: 1200
+  enable_thinking: false
+  top_p: null
+  top_k: null
+  min_p: null
+  frequency_penalty: null

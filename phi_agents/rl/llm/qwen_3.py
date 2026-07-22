@@ -3,10 +3,9 @@
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.
 #
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from threading import Event
-from typing import cast
 
 import numpy as np
 from transformers.models.auto.tokenization_auto import AutoTokenizer
@@ -51,6 +50,7 @@ class VLLMQwen3(TrainableLLM):
         top_k: int | None,
         frequency_penalty: float | None,
         max_model_len: int,
+        enable_thinking: bool = True,
         cancellation_event: Event | None = None,
     ):
         self._vllm = VLLMClient(host, port, cancellation_event)
@@ -62,15 +62,22 @@ class VLLMQwen3(TrainableLLM):
         self._min_p = min_p
         self._top_k = top_k
         self._frequency_penalty = frequency_penalty
+        self._enable_thinking = enable_thinking
+
+        self._tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+
+        def _special_token(content: str) -> SpecialToken:
+            token_id = self._tokenizer.convert_tokens_to_ids(content)
+            if not isinstance(token_id, int):
+                raise TypeError(f"Expected one token id for {content!r}, got {token_id!r}")
+            if token_id == self._tokenizer.unk_token_id:
+                raise ValueError(f"Tokenizer does not define required special token {content!r}")
+            return SpecialToken(id=token_id, content=content)
 
         self._special_tokens = {
-            # There are more, but these are the common ones
-            # Some tokens are noted in site below (we've seen <|endoftext|> predicted by model)
-            # https://github.com/QwenLM/Qwen/blob/main/tokenization_note.md
-            # Other special tokens can be found using print(tokenizer)
-            "bom": SpecialToken(id=151644, content="<|im_start|>"),
-            "eom": SpecialToken(id=151645, content="<|im_end|>"),
-            "eot": SpecialToken(id=151643, content="<|endoftext|>"),
+            "bom": _special_token("<|im_start|>"),
+            "eom": _special_token("<|im_end|>"),
+            "eot": _special_token("<|endoftext|>"),
         }
         self._stop_tokens: set[int] = set(
             [
@@ -79,8 +86,6 @@ class VLLMQwen3(TrainableLLM):
                 self._special_tokens["bom"].id,  # '<|im_start|>'
             ]
         )
-
-        self._tokenizer = AutoTokenizer.from_pretrained(base_model_path)
 
         # Validation checks
         _special_token_ids = set()
@@ -105,23 +110,52 @@ class VLLMQwen3(TrainableLLM):
     def special_tokens(self) -> dict[str, SpecialToken]:
         return self._special_tokens
 
+    def _apply_chat_template_tokens(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        add_generation_prompt: bool,
+    ) -> list[int]:
+        template_output = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=self._enable_thinking,
+        )
+        if isinstance(template_output, Mapping):
+            template_output = template_output["input_ids"]
+        if hasattr(template_output, "tolist"):
+            template_output = template_output.tolist()
+        if (
+            isinstance(template_output, list)
+            and len(template_output) == 1
+            and isinstance(template_output[0], list)
+        ):
+            template_output = template_output[0]
+        if not isinstance(template_output, list) or not all(
+            isinstance(token_id, int) for token_id in template_output
+        ):
+            raise TypeError(
+                "Expected apply_chat_template() to return a flat input_ids list, "
+                f"got {type(template_output).__name__}"
+            )
+        return template_output
+
     def get_generation_prompt_tokens(self) -> Sequence[int]:
         """Get generation prompt tokens (hacky)."""
-        dummy_msgs = [{"role": "system", "content": "dummy"}]
-        without_prompt_tokens = self.tokenizer.apply_chat_template(
+        # Qwen3.5's chat template requires a user query before it can open an
+        # assistant turn, even when we only need to discover the prompt suffix.
+        dummy_msgs = [
+            {"role": "system", "content": "dummy"},
+            {"role": "user", "content": "dummy"},
+        ]
+        without_prompt_tokens = self._apply_chat_template_tokens(
             dummy_msgs,
-            tokenize=True,
             add_generation_prompt=False,
-            enable_thinking=True,
         )
-        with_prompt_tokens: list[int] = cast(
-            list[int],
-            self.tokenizer.apply_chat_template(
-                dummy_msgs,
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            ),
+        with_prompt_tokens = self._apply_chat_template_tokens(
+            dummy_msgs,
+            add_generation_prompt=True,
         )
         assert without_prompt_tokens == with_prompt_tokens[: len(without_prompt_tokens)]
         generation_prompt_tokens = with_prompt_tokens[len(without_prompt_tokens) :]
@@ -155,14 +189,11 @@ class VLLMQwen3(TrainableLLM):
                 case _:
                     raise ValueError("Unsupported message type.")
             messages_for_tokenizer.append(m_for_tokenizer)
-        tokens = self.tokenizer.apply_chat_template(
+        tokens = self._apply_chat_template_tokens(
             messages_for_tokenizer,
-            tokenize=True,
             add_generation_prompt=add_generation_prompt,
-            enable_thinking=True,
         )
-        assert isinstance(tokens, list) and isinstance(tokens[0], int)
-        return cast(list[int], tokens)
+        return tokens
 
     def get_tokens(
         self, messages: list[Message], is_output: bool = False, log_probs: bool = False

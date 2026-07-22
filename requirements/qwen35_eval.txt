@@ -1,0 +1,9 @@
+# Qwen3.5 support compatible with Ubuntu 20.04 (glibc 2.31) and CUDA 12.x.
+vllm==0.19.1
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
+transformers==5.5.3
+click==8.2.1
+# Keep vLLM's open-ended CUTLASS dependency on torch 2.10's CUDA bindings.
+cuda-python==12.9.4
