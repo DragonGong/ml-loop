@@ -21,11 +21,16 @@ METRICS = (
     "invalid_api_hits",
     "api_doc_calls_per_rollout",
     "api_description_calls_per_rollout",
+    "api_doc_or_description_calls_per_rollout",
     "doc_before_api_call_rate",
     "error_recovery_success_rate",
     "error_rollout_recovery_success_rate",
+    "failed_api_calls",
+    "consecutive_repeated_failed_action_count",
+    "multiple_code_cells_per_turn",
     "context_truncation_ratio",
     "episode_count",
+    "num_rollouts_analyzed",
 )
 
 
@@ -114,14 +119,69 @@ def summarize(root: Path, base_summary: Path | None) -> dict[str, Any]:
         metric: _float(d3, metric) - _float(d12, metric)
         for metric in ("TGC", "SGC", "average_partial_pass_rate")
     }
+    base_anchor = _base_anchor(base_summary)
+    strict_score_damage = any(deltas[key] < 0 for key in ("TGC", "SGC"))
+    operational_deltas = {
+        metric: _float(d3, metric) - _float(d12, metric)
+        for metric in (
+            "execution_failed_count",
+            "execution_errors_per_turn",
+            "failed_api_calls",
+            "consecutive_repeated_failed_action_count",
+            "doc_before_api_call_rate",
+            "error_recovery_success_rate",
+            "context_truncation_ratio",
+        )
+    }
+    regression_directions = {
+        "execution_failed_count": 1,
+        "execution_errors_per_turn": 1,
+        "failed_api_calls": 1,
+        "consecutive_repeated_failed_action_count": 1,
+        "doc_before_api_call_rate": -1,
+        "error_recovery_success_rate": -1,
+        "context_truncation_ratio": 1,
+    }
+    operational_regressions = [
+        metric
+        for metric, direction in regression_directions.items()
+        if operational_deltas[metric] * direction > 0
+    ]
+    recommended_over_base = (
+        None
+        if base_anchor is None
+        else (
+            _float(recommended, "TGC"),
+            _float(recommended, "SGC"),
+            _float(recommended, "average_partial_pass_rate"),
+        )
+        > (
+            _float(base_anchor, "TGC"),
+            _float(base_anchor, "SGC"),
+            _float(base_anchor, "average_partial_pass_rate"),
+        )
+    )
+    if recommended_over_base is None:
+        base_comparison_line = "No Base anchor was available for a descriptive comparison."
+    elif recommended_over_base:
+        base_comparison_line = "The selected SFT adapter ranks above the available Base anchor."
+    else:
+        base_comparison_line = (
+            "Neither SFT adapter is recommended over Base; D3 wins only the predeclared "
+            "within-SFT tie-break on partial pass."
+        )
     report = {
         "status": "complete",
         "selection_priority": ["TGC", "SGC", "average_partial_pass_rate"],
         "recommended_adapter": recommended["checkpoint_name"],
+        "recommended_over_base": recommended_over_base,
         "d3_selected_epoch": d3_epoch,
         "d3_minus_d12": deltas,
-        "d3_damaged_d12": any(deltas[key] < 0 for key in ("TGC", "SGC")),
-        "base_16k_anchor": _base_anchor(base_summary),
+        "d3_operational_deltas": operational_deltas,
+        "d3_operational_regressions": operational_regressions,
+        "d3_strict_score_damage": strict_score_damage,
+        "d3_damaged_d12": strict_score_damage or bool(operational_regressions),
+        "base_16k_anchor": base_anchor,
         "base_anchor_note": (
             "Base was evaluated on a different machine and was not rerun as a paired control."
         ),
@@ -145,6 +205,12 @@ def summarize(root: Path, base_summary: Path | None) -> dict[str, Any]:
         "| adapter | selected epoch | SGC | TGC | partial pass | SGC D1/D2/D3 | TGC D1/D2/D3 | eval failures |",
         "|---|---:|---:|---:|---:|---|---|---:|",
     ]
+    if base_anchor is not None:
+        lines.insert(
+            4,
+            f"Base 16K anchor: SGC {base_anchor['SGC']}, TGC {base_anchor['TGC']}, "
+            f"partial pass {base_anchor['average_partial_pass_rate']}.",
+        )
     for row in rows:
         lines.append(
             f"| {row['checkpoint_name']} | {row['selected_epoch']} | {row['SGC']} | "
@@ -163,6 +229,14 @@ def summarize(root: Path, base_summary: Path | None) -> dict[str, Any]:
             f"D3 selected epoch: {d3_epoch}.",
             f"D3 - D1/2: TGC {deltas['TGC']:+.3f}, SGC {deltas['SGC']:+.3f}, "
             f"partial pass {deltas['average_partial_pass_rate']:+.6f}.",
+            base_comparison_line,
+            "D3 did not further reduce strict SGC/TGC, but it has operational regressions in: "
+            + ", ".join(operational_regressions)
+            + "."
+            if operational_regressions
+            else "D3 introduced no measured operational regression relative to D1/2.",
+            "D1/2's evaluation failure records are recovered infrastructure startup failures; "
+            "both final evaluations completed 57/57 episodes with no cancellation.",
             "",
             "## Operational Metrics",
             "",

@@ -48,14 +48,19 @@ def test_two_stage_summary_recommends_by_tgc_then_sgc_then_partial(tmp_path) -> 
         "TGC_3": 0.0,
         "execution_failed_count": 1,
         "execution_errors_per_turn": 0.1,
+        "failed_api_calls": 2,
+        "consecutive_repeated_failed_action_count": 3,
+        "multiple_code_cells_per_turn": 0.0,
         "invalid_api_hits": 0,
         "api_doc_calls_per_rollout": 2.0,
         "api_description_calls_per_rollout": 1.0,
+        "api_doc_or_description_calls_per_rollout": 3.0,
         "doc_before_api_call_rate": 0.8,
         "error_recovery_success_rate": 0.5,
         "error_rollout_recovery_success_rate": 0.4,
         "context_truncation_ratio": 0.0,
         "episode_count": 57,
+        "num_rollouts_analyzed": 57,
         "split": "dev",
     }
     _write_json(
@@ -64,7 +69,16 @@ def test_two_stage_summary_recommends_by_tgc_then_sgc_then_partial(tmp_path) -> 
     )
     _write_json(
         root / "evaluation" / "d3" / "summary.json",
-        [{"checkpoint_name": "d3", "SGC": 19.0, "TGC": 41.0, "average_partial_pass_rate": 0.5, **metrics}],
+        [
+            {
+                "checkpoint_name": "d3",
+                "SGC": 20.0,
+                "TGC": 41.0,
+                "average_partial_pass_rate": 0.5,
+                **metrics,
+                "execution_failed_count": 2,
+            }
+        ],
     )
     _write_json(
         root / "training" / "d12" / "train_metrics.json",
@@ -92,7 +106,10 @@ def test_two_stage_summary_recommends_by_tgc_then_sgc_then_partial(tmp_path) -> 
 
     assert report["recommended_adapter"] == "d3"
     assert report["d3_minus_d12"]["TGC"] == 1.0
+    assert report["d3_strict_score_damage"] is False
+    assert report["d3_operational_regressions"] == ["execution_failed_count"]
     assert report["d3_damaged_d12"] is True
+    assert report["recommended_over_base"] is False
     assert report["base_16k_anchor"]["TGC"] == 42.1
     with (root / "summary.csv").open() as handle:
         assert [row["checkpoint_name"] for row in csv.DictReader(handle)] == ["d12", "d3"]
