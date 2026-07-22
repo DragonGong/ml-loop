@@ -30,11 +30,21 @@ def timeit(
             logger.info(f"{name} took: {end_time - start_time:.2f} s")
 
 
+def _torch_dist_barrier() -> None:
+    import torch
+    import torch.distributed as dist
+
+    if dist.get_backend() == "nccl":
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
 def torch_dist_barrier() -> None:
     import torch.distributed as dist
 
     if dist.is_initialized():
-        dist.barrier()
+        _torch_dist_barrier()
 
 
 @contextlib.contextmanager
@@ -46,9 +56,9 @@ def barrier_guard(before: bool = True, after: bool = True):  # type: ignore
         return
 
     if before:
-        dist.barrier()
+        _torch_dist_barrier()
 
     yield
 
     if after:
-        dist.barrier()
+        _torch_dist_barrier()

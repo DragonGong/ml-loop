@@ -8,6 +8,9 @@ set -euo pipefail
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen25_7b_loop_200x24x6_lora16}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train_difficulty_1_2}"
 ACCELERATE_BIN="${ACCELERATE_BIN:-accelerate}"
+ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-./phi_agents/rl/conf/accelerate_config.yaml}"
+GPU_ALLOCATION="${GPU_ALLOCATION:-single_gpu}"
+NUM_LEARNING_PROCESSES="${NUM_LEARNING_PROCESSES:-1}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -18,14 +21,23 @@ cp "data/appworld_splits/${TRAIN_SPLIT}.txt" "$APPWORLD_ROOT/data/datasets/${TRA
 
 echo "experiment_name=${EXPERIMENT_NAME}"
 echo "train_split=${TRAIN_SPLIT} repo_count=$(wc -l < "data/appworld_splits/${TRAIN_SPLIT}.txt") appworld_count=$(wc -l < "$APPWORLD_ROOT/data/datasets/${TRAIN_SPLIT}.txt")"
+echo "gpu_allocation=${GPU_ALLOCATION} num_learning_processes=${NUM_LEARNING_PROCESSES} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 echo "note=trainer saves every iteration; sync/eval watcher defaults to every 10 iterations."
 
-"$ACCELERATE_BIN" launch \
-  --config_file ./phi_agents/rl/conf/accelerate_config.yaml \
-  --num_processes=1 \
+accelerate_args=(
+  launch
+  --config_file "$ACCELERATE_CONFIG_FILE"
+  --num_processes "$NUM_LEARNING_PROCESSES"
+)
+if [[ -n "${FSDP_OFFLOAD_PARAMS:-}" ]]; then
+  accelerate_args+=(--fsdp_offload_params "$FSDP_OFFLOAD_PARAMS")
+  echo "fsdp_offload_params=$FSDP_OFFLOAD_PARAMS"
+fi
+
+"$ACCELERATE_BIN" "${accelerate_args[@]}" \
   ./phi_agents/rl/train.py \
   +global@_global_=appworld \
-  rl/gpu_allocation=single_gpu \
+  rl/gpu_allocation="$GPU_ALLOCATION" \
   llm=qwen_2_5_7b_lora16_train \
   experiment_name="$EXPERIMENT_NAME" \
   wandb.enable="${WANDB_ENABLE:-False}" \

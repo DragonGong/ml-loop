@@ -1,4 +1,6 @@
+import ast
 import json
+import stat
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from phi_agents.evals.appworld_rollout_data import (
     AppWorldTrainingRollout,
 )
 from phi_agents.rl.rollout_diagnostics import (
+    _redact_sensitive_text,
     compute_rollout_diagnostics,
     sanitized_trajectory_payload,
     save_rollout_diagnostics,
@@ -213,6 +216,59 @@ def test_sanitized_trajectory_omits_privileged_and_token_data() -> None:
     assert "[REDACTED]" in serialized
 
 
+def test_redaction_preserves_python_delimiters_and_removes_credentials_and_pii() -> None:
+    jwt = "eyJheaderpart123.payloadpart123.signaturepart123"
+    source = (
+        "fs_password = 'literal-password'\n"
+        f"phone_token = '{jwt}'\n"
+        "result = login(password=fs_password, access_token=phone_token)\n"
+        "payload = {'password': 'nested-password', 'access_token': phone_token}\n"
+    )
+
+    safe = _redact_sensitive_text(source)
+
+    ast.parse(safe)
+    assert "literal-password" not in safe
+    assert "nested-password" not in safe
+    assert jwt not in safe
+    assert "fs_password = '[REDACTED]'" in safe
+    assert 'access_token="[REDACTED]")' in safe
+    assert "'password': '[REDACTED]'" in safe
+
+    prose = _redact_sensitive_text(
+        "Found venmo password: plain-secret) My name is: Alice Smith. "
+        "email=alice@example.com phone=+86 138-1234-5678"
+    )
+    assert prose.endswith("phone=[REDACTED_PHONE]")
+    assert "plain-secret" not in prose
+    assert "Alice Smith" not in prose
+    assert "alice@example.com" not in prose
+
+
+def test_trajectory_literal_registry_redacts_unlabelled_repeated_secret() -> None:
+    repeated_secret = "same-secret-everywhere"
+    rollout = _rollout(
+        task_id="safe_registry_1",
+        ret=0.0,
+        success=False,
+        passes=0,
+        turns=[
+            (
+                "```python\nprint(apis.supervisor.show_account_passwords())\n```",
+                f'{{"password": "{repeated_secret}", "first_name": "Alice"}}\n'
+                f"{repeated_secret}\nAlice",
+            )
+        ],
+    )
+
+    payload = sanitized_trajectory_payload(rollout, iteration=1, scenario_idx=0, rollout_idx=0)
+    serialized = json.dumps(payload)
+
+    assert repeated_secret not in serialized
+    assert "Alice" not in serialized
+    assert payload["schema_version"] == "appworld-sanitized-trajectory-v2"
+
+
 def test_independent_trajectory_paths_and_no_overwrite(tmp_path: Path) -> None:
     grouped = [
         [
@@ -234,6 +290,8 @@ def test_independent_trajectory_paths_and_no_overwrite(tmp_path: Path) -> None:
         tmp_path / "trajectories/iteration-000003/scenario-0000/rollout-01/trajectory.json",
     ]
     assert all(path.is_file() for path in paths)
+    assert all(len(path.read_text(encoding="utf-8").splitlines()) == 1 for path in paths)
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths)
     assert json.loads(paths[0].read_text())["rollout_idx"] == 0
     assert json.loads(paths[1].read_text())["rollout_idx"] == 1
     with pytest.raises(FileExistsError, match="refusing to overwrite"):

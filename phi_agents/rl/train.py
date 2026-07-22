@@ -9,6 +9,7 @@ import itertools
 import json
 import math
 import os
+import random
 import sys
 import tempfile
 from collections.abc import Iterable, Sequence
@@ -64,7 +65,11 @@ from phi_agents.rl.type_defs import TrainingRollout
 from phi_agents.rl.utils.download import (
     distributed_download_models,
 )
-from phi_agents.rl.utils.fsdp2_utils import setup_fsdp2_model, setup_mixed_precision_policy
+from phi_agents.rl.utils.fsdp2_utils import (
+    setup_cpu_offload_policy,
+    setup_fsdp2_model,
+    setup_mixed_precision_policy,
+)
 from phi_agents.rl.utils.ray_utils import (
     VLLM_RESOURCE,
     connect_ray_cluster,
@@ -97,6 +102,148 @@ null_logger = NullLogger()
 
 type OptimizedModule = Any  # torch._dynamo.eval_frame.OptimizedModule
 type ModelType = PeftModel | OptimizedModule
+
+
+_RANK_TRAINING_STATE_SCHEMA_VERSION = 1
+_RANK_TRAINING_STATE_DIRECTORY = "training_state"
+
+
+def _numpy_global_rng_state() -> dict[str, Any]:
+    """Return the legacy NumPy RNG state using weights-only-safe values."""
+    bit_generator, keys, position, has_gauss, cached_gaussian = np.random.get_state()
+    return {
+        "bit_generator": bit_generator,
+        "keys": torch.from_numpy(keys.copy()),
+        "position": int(position),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached_gaussian),
+    }
+
+
+def _set_numpy_global_rng_state(state: dict[str, Any]) -> None:
+    keys = state["keys"]
+    if not isinstance(keys, torch.Tensor):
+        raise ValueError("NumPy RNG keys must be stored as a torch.Tensor")
+    np.random.set_state(
+        (
+            str(state["bit_generator"]),
+            keys.cpu().numpy().astype(np.uint32, copy=False),
+            int(state["position"]),
+            int(state["has_gauss"]),
+            float(state["cached_gaussian"]),
+        )
+    )
+
+
+def _capture_rng_state(training_rng: np.random.Generator) -> dict[str, Any]:
+    """Capture all RNGs that can affect learner updates after a checkpoint."""
+    return {
+        "python": random.getstate(),
+        "numpy_global": _numpy_global_rng_state(),
+        # ``default_rng`` uses PCG64 here, whose state is made only of safe
+        # primitive values. This generator chooses the minibatch/epoch order.
+        "training_sampler": training_rng.bit_generator.state,
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def _restore_rng_state(state: dict[str, Any], training_rng: np.random.Generator) -> None:
+    """Restore RNGs captured by :func:`_capture_rng_state`."""
+    random.setstate(state["python"])
+    _set_numpy_global_rng_state(state["numpy_global"])
+    training_rng.bit_generator.state = state["training_sampler"]
+    torch.set_rng_state(state["torch_cpu"])
+
+    cuda_states = state.get("torch_cuda", [])
+    if cuda_states:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Checkpoint contains CUDA RNG state, but CUDA is unavailable")
+        if len(cuda_states) != torch.cuda.device_count():
+            raise RuntimeError(
+                "CUDA device count changed across resume: "
+                f"checkpoint={len(cuda_states)} current={torch.cuda.device_count()}"
+            )
+        torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _capture_rank_training_state(
+    *,
+    optimizer: Optimizer,
+    lr_scheduler: LRScheduler,
+    training_rng: np.random.Generator,
+    rank: int,
+    world_size: int,
+    gradient_rms: GradientRMS,
+    invalid_steps_skipped: int,
+    high_kl_events: int,
+    n_outlier_grads: int,
+    scaler: Any | None = None,
+) -> dict[str, Any]:
+    """Build the rank-local state required for an exact iteration-boundary resume."""
+    return {
+        "schema_version": _RANK_TRAINING_STATE_SCHEMA_VERSION,
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "optimizer": optimizer.state_dict(),
+        "lr_scheduler": lr_scheduler.state_dict(),
+        "rng": _capture_rng_state(training_rng),
+        "gradient_rms": {
+            "mean": float(gradient_rms.mean),
+            "var": float(gradient_rms.var),
+            "count": int(gradient_rms.count),
+        },
+        "counters": {
+            "invalid_steps_skipped": int(invalid_steps_skipped),
+            "high_kl_events": int(high_kl_events),
+            "n_outlier_grads": int(n_outlier_grads),
+        },
+        "grad_scaler": scaler.state_dict() if scaler is not None else None,
+    }
+
+
+def _restore_rank_training_state(
+    state: dict[str, Any],
+    *,
+    optimizer: Optimizer,
+    lr_scheduler: LRScheduler,
+    training_rng: np.random.Generator,
+    rank: int,
+    world_size: int,
+    gradient_rms: GradientRMS,
+    scaler: Any | None = None,
+) -> dict[str, int]:
+    """Restore optimizer, scheduler, RNG and rank-local trainer statistics."""
+    if state.get("schema_version") != _RANK_TRAINING_STATE_SCHEMA_VERSION:
+        raise ValueError(
+            "Unsupported rank training-state schema: " f"{state.get('schema_version')!r}"
+        )
+    if int(state.get("rank", -1)) != rank:
+        raise ValueError(f"Checkpoint rank {state.get('rank')!r} does not match rank {rank}")
+    if int(state.get("world_size", -1)) != world_size:
+        raise ValueError(
+            "Checkpoint world size does not match the current run: "
+            f"{state.get('world_size')!r} != {world_size}"
+        )
+
+    optimizer.load_state_dict(state["optimizer"])
+    lr_scheduler.load_state_dict(state["lr_scheduler"])
+
+    gradient_rms_state = state["gradient_rms"]
+    gradient_rms.mean = float(gradient_rms_state["mean"])
+    gradient_rms.var = float(gradient_rms_state["var"])
+    gradient_rms.count = int(gradient_rms_state["count"])
+
+    scaler_state = state.get("grad_scaler")
+    if scaler_state is not None:
+        if scaler is None:
+            raise RuntimeError("Checkpoint contains GradScaler state, but no scaler is active")
+        scaler.load_state_dict(scaler_state)
+
+    # Restore RNG last: model construction, wrapping, and state loading are
+    # allowed to consume randomness without changing the continued sequence.
+    _restore_rng_state(state["rng"], training_rng)
+    return {key: int(value) for key, value in state["counters"].items()}
 
 
 def get_temp_local_directory(local_rank: int) -> Path:
@@ -315,9 +462,7 @@ def sampled_token_entropy_stats(rollouts: Sequence[TrainingRollout]) -> dict[str
         "definition": "mean sampled-token surprisal -log(p), in nats",
         "finite_output_tokens": finite_output_tokens,
         "nonfinite_output_tokens": nonfinite_output_tokens,
-        "mean_nats": (
-            total_surprisal / finite_output_tokens if finite_output_tokens > 0 else None
-        ),
+        "mean_nats": (total_surprisal / finite_output_tokens if finite_output_tokens > 0 else None),
     }
 
 
@@ -395,9 +540,7 @@ class IterationMetricAccumulator:
         )
         return {
             "schema_version": "loop-iteration-training-metrics-v1",
-            "timestamp": datetime.datetime.now(datetime.UTC)
-            .isoformat()
-            .replace("+00:00", "Z"),
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
             "status": status,
             "iteration": self.iteration,
             "started_at": self.started_at,
@@ -455,10 +598,7 @@ def _finite_or_none(value: float | None) -> float | None:
     return float(value)
 
 
-def write_iteration_metric_report(cloud_path: Path, report: dict[str, Any]) -> Path:
-    """Atomically persist one rank-zero iteration report."""
-    iteration = int(report["iteration"])
-    path = cloud_path / "training_metrics" / f"iteration-{iteration:06d}.json"
+def _write_metric_payload(path: Path, report: dict[str, Any]) -> None:
     data = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
     scheme, raw_path = fu.get_scheme_and_path(path)
     if scheme == "file":
@@ -483,6 +623,34 @@ def write_iteration_metric_report(cloud_path: Path, report: dict[str, Any]) -> P
             fu.copy(temporary_name, path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
+
+
+def write_iteration_metric_report(cloud_path: Path, report: dict[str, Any]) -> Path:
+    """Atomically persist metrics without downgrading a completed canonical report."""
+    iteration = int(report["iteration"])
+    path = cloud_path / "training_metrics" / f"iteration-{iteration:06d}.json"
+    if report.get("status") == "failed" and fu.exists(path):
+        with fu.uri_open(path, "r") as file_handle:
+            existing = json.load(file_handle)
+        if isinstance(existing, dict) and existing.get("status") == "completed":
+            timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+            audit_path = (
+                cloud_path
+                / "training_metrics"
+                / "interruption_audits"
+                / f"iteration-{iteration:06d}-{timestamp}.json"
+            )
+            audit_report = {
+                **report,
+                "schema_version": "loop-iteration-interruption-audit-v1",
+                "source_metrics_schema_version": report.get("schema_version"),
+                "record_kind": "post_completion_interruption_audit",
+                "canonical_status_preserved": "completed",
+            }
+            _write_metric_payload(audit_path, audit_report)
+            return audit_path
+
+    _write_metric_payload(path, report)
     return path
 
 
@@ -493,6 +661,18 @@ def _snapshot_trainable_parameters(model: ModelType) -> list[tuple[torch.Tensor,
         for parameter in model.parameters()
         if parameter.requires_grad
     ]
+
+
+def _distributed_all_reduce(tensor: torch.Tensor, op: dist.ReduceOp) -> torch.Tensor:
+    """Reduce a tensor on a device supported by the active process-group backend."""
+    if not dist.is_initialized():
+        return tensor
+    if dist.get_backend() == "nccl" and tensor.device.type != "cuda":
+        reduced = tensor.to(torch.device("cuda", torch.cuda.current_device()))
+        dist.all_reduce(reduced, op=op)
+        return reduced.to(tensor.device)
+    dist.all_reduce(tensor, op=op)
+    return tensor
 
 
 @torch.no_grad()
@@ -513,8 +693,7 @@ def _parameter_update_l2_norm(
         )
     if local_squared_norm is None:
         return 0.0
-    if dist.is_initialized():
-        dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
+    local_squared_norm = _distributed_all_reduce(local_squared_norm, dist.ReduceOp.SUM)
     return float(torch.sqrt(local_squared_norm).item())
 
 
@@ -781,24 +960,86 @@ class RLOOTrainer:
         else:
             raise AssertionError(f"{self._cfg.fsdp=} is not supported")
 
+        # Optimizer state is rank-local under FSDP. Save one compact file per
+        # rank instead of Accelerate's full-model checkpoint. The barrier keeps
+        # the cloud uploader from committing a partially written checkpoint.
+        self._save_rank_training_state(checkpoint_dir)
+        self._accelerator.wait_for_everyone()
+
         if self._rank == 0:
             self._save_trainer_state(checkpoint_dir / "trainer_state.pt")
 
-        # Optional: save optimizer, scheduler, RNG states (needs to happen on all ranks)
-        # (HF Accelerate checkpoints are huge with this feature enabled and it does not seem to be necessary)
-        # self._accelerator.wait_for_everyone()
-        # accelerator_state_dir = checkpoint_dir / "accelerator_state"
-        # accelerator_state_dir.mkdir(parents=True, exist_ok=True)
-        # logger.info(f"Saving accelerator state to {accelerator_state_dir}...")
-        # self._accelerator.save_state(str(accelerator_state_dir))
-
         self._accelerator.wait_for_everyone()
+
+    def _rank_training_state_path(self, checkpoint_dir: Path) -> Path:
+        return checkpoint_dir / _RANK_TRAINING_STATE_DIRECTORY / f"rank-{self._rank:05d}.pt"
+
+    def _save_rank_training_state(self, checkpoint_dir: Path) -> None:
+        assert self._optimizer is not None
+        assert self._lr_scheduler is not None
+        state_path = self._rank_training_state_path(checkpoint_dir)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state = _capture_rank_training_state(
+            optimizer=self._optimizer,
+            lr_scheduler=self._lr_scheduler,
+            training_rng=self._rng,
+            rank=self._rank,
+            world_size=self._world_size,
+            gradient_rms=self._grad_rms,
+            invalid_steps_skipped=self._invalid_steps_skipped,
+            high_kl_events=self._high_kl_events,
+            n_outlier_grads=self._n_outlier_grads,
+            scaler=self._accelerator.scaler,
+        )
+        temporary_path = state_path.with_suffix(f"{state_path.suffix}.tmp")
+        try:
+            torch.save(state, temporary_path)
+            temporary_path.replace(state_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        self._rank0_logger.info(f"Saved exact rank training state to {state_path}")
+
+    def _load_rank_training_state(
+        self,
+        checkpoint_dir: Path,
+        optimizer: Optimizer,
+        lr_scheduler: LRScheduler,
+    ) -> bool:
+        state_path = self._rank_training_state_path(checkpoint_dir)
+        if not state_path.is_file():
+            self._rank0_logger.warning(
+                "Checkpoint has no exact rank training state; continuing with a fresh "
+                "optimizer and reconstructed scheduler. This legacy resume cannot recover "
+                f"Adam moments or RNG streams: {checkpoint_dir}"
+            )
+            return False
+
+        state = safe_torch_load(state_path, mmap=False)
+        counters = _restore_rank_training_state(
+            state,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            training_rng=self._rng,
+            rank=self._rank,
+            world_size=self._world_size,
+            gradient_rms=self._grad_rms,
+            scaler=self._accelerator.scaler,
+        )
+        self._invalid_steps_skipped = counters["invalid_steps_skipped"]
+        self._high_kl_events = counters["high_kl_events"]
+        self._n_outlier_grads = counters["n_outlier_grads"]
+        self._rank0_logger.info(
+            "Restored exact optimizer, scheduler, RNG, minibatch sampler, and trainer "
+            f"statistics from {state_path}"
+        )
+        return True
 
     def _save_trainer_state(
         self,
         trainer_state_path: Path,
     ) -> None:
         trainer_state = {
+            "checkpoint_schema_version": 2,
             "iterations_completed": self._iterations_completed,
             "output_tokens_generated": self._output_tokens_generated,
             "rollouts_generated": self._rollouts_generated,
@@ -937,9 +1178,7 @@ class RLOOTrainer:
         )
         return path
 
-    def _persist_failed_iteration_metrics(
-        self, exc: BaseException, *, failure_event: str
-    ) -> None:
+    def _persist_failed_iteration_metrics(self, exc: BaseException, *, failure_event: str) -> None:
         try:
             self._persist_iteration_metrics(
                 status="failed",
@@ -994,9 +1233,7 @@ class RLOOTrainer:
 
         scheme, raw_cloud_path = fu.get_scheme_and_path(self._cfg.cloud_path)
         if scheme != "file":
-            raise ValueError(
-                "rl.rollout_diagnostics currently requires a local file cloud_path"
-            )
+            raise ValueError("rl.rollout_diagnostics currently requires a local file cloud_path")
         run_path = Path(raw_cloud_path)
         diagnostics = compute_rollout_diagnostics(
             appworld_groups,
@@ -1011,11 +1248,7 @@ class RLOOTrainer:
         ]
         save_rollout_diagnostics(
             diagnostics,
-            output_path=(
-                run_path
-                / "rollout_diagnostics"
-                / f"iteration-{iteration:06d}.json"
-            ),
+            output_path=(run_path / "rollout_diagnostics" / f"iteration-{iteration:06d}.json"),
         )
         trajectory_count = 0
         if bool(diagnostics_cfg.get("save_trajectories", True)):
@@ -1118,7 +1351,12 @@ class RLOOTrainer:
             num_training_steps=self._cfg.params.total_iterations,
             last_epoch=-1,
         )
-        if self._iterations_completed > 0:
+        exact_state_available = (
+            checkpoint_dir is not None and self._rank_training_state_path(checkpoint_dir).is_file()
+        )
+        if self._iterations_completed > 0 and not exact_state_available:
+            # Backward compatibility for checkpoints written before exact
+            # optimizer/scheduler state was introduced.
             lr_scheduler.step(self._iterations_completed)
 
         # FSDP / DDP wrapping
@@ -1136,6 +1374,9 @@ class RLOOTrainer:
                 model, optimizer, lr_scheduler = self._accelerator.prepare(
                     model, optimizer, lr_scheduler
                 )
+
+        if checkpoint_dir is not None:
+            self._load_rank_training_state(checkpoint_dir, optimizer, lr_scheduler)
 
         self._accelerator.wait_for_everyone()
         return model, optimizer, lr_scheduler
@@ -1167,8 +1408,7 @@ class RLOOTrainer:
         output_tokens = [sum(rollout.policy_token_info.is_output) for rollout in rollouts]
         below_threshold = sorted_abs_adv < adv_threshold
         below_threshold_rollouts = [
-            sorted_rollouts[index]
-            for index in np.where(below_threshold)[0]
+            sorted_rollouts[index] for index in np.where(below_threshold)[0]
         ]
 
         # this can be O(logn) but linear time here should be fine
@@ -1205,8 +1445,7 @@ class RLOOTrainer:
             "candidate_output_tokens": sum(output_tokens),
             "below_threshold_rollouts": len(below_threshold_rollouts),
             "below_threshold_output_tokens": sum(
-                sum(rollout.policy_token_info.is_output)
-                for rollout in below_threshold_rollouts
+                sum(rollout.policy_token_info.is_output) for rollout in below_threshold_rollouts
             ),
             "retained_rollouts_after_world_size_rounding": n_keep,
             "retained_output_tokens_after_world_size_rounding": retained_output_tokens,
@@ -1576,10 +1815,10 @@ class RLOOTrainer:
             total_norm = total_norm.to(self._device).full_tensor()
 
         if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX)
+            total_norm = _distributed_all_reduce(total_norm, dist.ReduceOp.MAX)
         else:
             total_norm **= norm_type
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM)
+            total_norm = _distributed_all_reduce(total_norm, dist.ReduceOp.SUM)
             total_norm **= 1.0 / norm_type
 
         clip_coef = max_norm / (total_norm + 1e-6)
@@ -1690,9 +1929,7 @@ class RLOOTrainer:
                     if info.ppo is not None
                 ),
                 sum(
-                    info.ppo.total_observations
-                    for info in loss_debug_infos
-                    if info.ppo is not None
+                    info.ppo.total_observations for info in loss_debug_infos if info.ppo is not None
                 ),
             ],
             dtype=torch.float64,
@@ -2107,7 +2344,11 @@ class RLOOTrainer:
             # check if there is an existing checkpoint, and if so, resume from it
             if (last_checkpoint := get_last_checkpoint(self._cfg.cloud_path)) is not None:
                 last_checkpoint_local_path = self._local_path / last_checkpoint.name
-                fu.copy(last_checkpoint, last_checkpoint_local_path)
+                # All local ranks share the same temporary directory. Copy once,
+                # then make the completed checkpoint visible to every rank.
+                if self._rank == 0:
+                    fu.copy(last_checkpoint, last_checkpoint_local_path)
+                self._accelerator.wait_for_everyone()
                 self._load_trainer_state(last_checkpoint_local_path)
             else:
                 last_checkpoint_local_path = None
@@ -2194,7 +2435,7 @@ class RLOOTrainer:
                         self._setup_model_optimizer_lr(last_checkpoint_local_path)
                     )
 
-                if self._iterations_completed == 0:
+                if self._iterations_completed == 0 or self._cfg.stress_test_on_resume:
                     self._run_stress_test()
 
             local_rollouts = list(itertools.chain(*rollouts))  # flatten the list of lists
@@ -2208,13 +2449,9 @@ class RLOOTrainer:
                 exc.finished_rollouts = finished_rollouts  # type: ignore[attr-defined]
                 exc.expected_rollouts = expected_rollouts  # type: ignore[attr-defined]
                 raise exc
-            self._commit_iteration_manifest(
-                target_iteration, expected_rollouts, finished_rollouts
-            )
+            self._commit_iteration_manifest(target_iteration, expected_rollouts, finished_rollouts)
             self._persist_rollout_diagnostics(rollouts, iteration=target_iteration)
-            with profile("recycle_scenario_runners"), timeit(
-                "recycle_scenario_runners", logger
-            ):
+            with profile("recycle_scenario_runners"), timeit("recycle_scenario_runners", logger):
                 self._rollout_worker.recycle_scenario_runners()
 
             if (
@@ -2450,6 +2687,7 @@ def main() -> int:
     accelerator = Accelerator(kwargs_handlers=[init_proc])
 
     setup_mixed_precision_policy(accelerator)
+    setup_cpu_offload_policy(accelerator)
 
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(_cfg))
@@ -2457,6 +2695,8 @@ def main() -> int:
     local_rank = accelerator.local_process_index
     rank = accelerator.process_index
     world_size = accelerator.num_processes
+    if accelerator.device.type == "cuda":
+        torch.cuda.set_device(accelerator.device)
 
     connect_ray_cluster(rank=rank, barrier=torch_dist_barrier)
 

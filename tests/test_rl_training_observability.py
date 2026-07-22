@@ -80,6 +80,38 @@ def test_iteration_metric_report_uses_token_weighting_and_strict_json(tmp_path) 
     assert not list(path.parent.glob("*.tmp"))
 
 
+def test_failed_metric_report_cannot_overwrite_completed_canonical_report(tmp_path) -> None:
+    completed = {
+        "schema_version": "loop-iteration-training-metrics-v1",
+        "timestamp": "2026-07-18T00:00:00Z",
+        "status": "completed",
+        "iteration": 1,
+        "actual_optimizer_steps": 12,
+    }
+    failed = {
+        **completed,
+        "timestamp": "2026-07-18T00:01:00Z",
+        "status": "failed",
+        "failure": {"event": "training_failed", "exception_type": "KeyboardInterrupt"},
+    }
+    canonical_path = write_iteration_metric_report(tmp_path, completed)
+    canonical_bytes = canonical_path.read_bytes()
+
+    audit_path = write_iteration_metric_report(tmp_path, failed)
+
+    assert canonical_path.read_bytes() == canonical_bytes
+    assert json.loads(canonical_path.read_text())["status"] == "completed"
+    assert audit_path != canonical_path
+    assert audit_path.parent == tmp_path / "training_metrics/interruption_audits"
+    audit = json.loads(audit_path.read_text())
+    assert audit["status"] == "failed"
+    assert audit["schema_version"] == "loop-iteration-interruption-audit-v1"
+    assert audit["source_metrics_schema_version"] == "loop-iteration-training-metrics-v1"
+    assert audit["record_kind"] == "post_completion_interruption_audit"
+    assert audit["canonical_status_preserved"] == "completed"
+    assert not list(audit_path.parent.glob("*.tmp"))
+
+
 def test_sampled_token_entropy_is_output_token_surprisal() -> None:
     stats = sampled_token_entropy_stats(
         [

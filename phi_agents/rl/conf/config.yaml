@@ -51,6 +51,9 @@ rl:
   # Normally this is zero-cost since it runs during vLLM initialization.
   # Disable if needed by setting to 0 for faster init and debugging.
   stress_test_iters: 2
+  # Existing checkpoints normally skip the initial stress test. Enable this when validating a
+  # resumed run on new hardware before launching the full training job.
+  stress_test_on_resume: false
 
   eval:
     enable: False

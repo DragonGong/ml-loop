@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -212,6 +213,7 @@ class ManifestAppWorldScenarioSampler(Iterator[AppWorldScenario]):
         start_iteration: int = 1,
         cycle: bool = True,
         max_parallel: int = 1,
+        distributed_shard: bool = False,
     ):
         if isinstance(start_iteration, bool) or int(start_iteration) != start_iteration:
             raise ValueError("start_iteration must be an integer")
@@ -222,7 +224,7 @@ class ManifestAppWorldScenarioSampler(Iterator[AppWorldScenario]):
 
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        self._task_batches, manifest_dataset = self._validate_manifest(manifest)
+        task_batches, manifest_dataset = self._validate_manifest(manifest)
 
         if dataset_name is not None and dataset_name != manifest_dataset:
             raise ValueError(
@@ -231,14 +233,44 @@ class ManifestAppWorldScenarioSampler(Iterator[AppWorldScenario]):
             )
         self.dataset_name = manifest_dataset
         self.start_iteration = int(start_iteration)
-        if not 1 <= self.start_iteration <= len(self._task_batches):
+        if not 1 <= self.start_iteration <= len(task_batches):
             raise ValueError(
-                f"start_iteration must be in [1, {len(self._task_batches)}], "
+                f"start_iteration must be in [1, {len(task_batches)}], "
                 f"got {self.start_iteration}"
             )
 
         self.cycle = bool(cycle)
         self.max_parallel = max_parallel
+        self.distributed_shard = bool(distributed_shard)
+        self.distributed_rank = 0
+        self.distributed_world_size = 1
+        if self.distributed_shard:
+            try:
+                self.distributed_rank = int(os.environ.get("RANK", "0"))
+                self.distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            except ValueError as exc:
+                raise ValueError("RANK and WORLD_SIZE must be integers") from exc
+            if self.distributed_world_size <= 0:
+                raise ValueError("WORLD_SIZE must be positive")
+            if not 0 <= self.distributed_rank < self.distributed_world_size:
+                raise ValueError(
+                    "RANK must be in [0, WORLD_SIZE): "
+                    f"rank={self.distributed_rank} world_size={self.distributed_world_size}"
+                )
+
+            scenarios_per_iteration = len(task_batches[0])
+            if scenarios_per_iteration % self.distributed_world_size != 0:
+                raise ValueError(
+                    "Manifest scenarios_per_iteration must be divisible by WORLD_SIZE: "
+                    f"scenarios_per_iteration={scenarios_per_iteration} "
+                    f"world_size={self.distributed_world_size}"
+                )
+            shard_size = scenarios_per_iteration // self.distributed_world_size
+            shard_start = self.distributed_rank * shard_size
+            shard_stop = shard_start + shard_size
+            task_batches = [batch[shard_start:shard_stop] for batch in task_batches]
+
+        self._task_batches = task_batches
         self._iteration_index = self.start_iteration - 1
         self._scenario_index = 0
         self._exhausted = False

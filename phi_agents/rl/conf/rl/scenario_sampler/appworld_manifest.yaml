@@ -4,3 +4,4 @@ dataset_name: train_difficulty_1_2
 start_iteration: 1
 cycle: true
 max_parallel: 1
+distributed_shard: false

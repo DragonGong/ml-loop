@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import tempfile
 from collections import Counter
 from numbers import Integral
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -20,12 +23,11 @@ from phi_agents.rl.rl_utils import Baseline, compute_loop_advantages
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     from phi_agents.evals.appworld_rollout_data import AppWorldTrainingRollout
 
 SCHEMA_VERSION = "appworld-rollout-diagnostics-v1"
-SANITIZED_TRAJECTORY_SCHEMA_VERSION = "appworld-sanitized-trajectory-v1"
+SANITIZED_TRAJECTORY_SCHEMA_VERSION = "appworld-sanitized-trajectory-v2"
 
 CODE_BLOCK_RE = re.compile(r"```(?:python|py)\s*\n?(.*?)```", flags=re.IGNORECASE | re.DOTALL)
 PARTIAL_CODE_RE = re.compile(r"```(?:python|py)\s*\n?(.*)$", flags=re.IGNORECASE | re.DOTALL)
@@ -50,19 +52,78 @@ INVALID_API_PATTERNS = tuple(
     )
 )
 
-# These expressions remove common credentials without altering ordinary AppWorld observations.
-# They intentionally do not redact task-relevant names, email addresses, or phone numbers from the
-# visible conversation; callers that require PII removal should apply a domain-specific policy.
-SECRET_HEADER_RE = re.compile(r"(?im)^(?P<prefix>\s*(?:authorization|cookie|set-cookie)\s*:\s*).+$")
-QUOTED_SECRET_RE = re.compile(
-    r"(?i)(?P<prefix>[\"'](?:password|passwd|api[_-]?key|token|auth[_-]?token|"
-    r"access[_-]?token|refresh[_-]?token|authorization|cookie|webhook(?:_url)?)[\"']\s*:\s*)"
-    r"(?P<value>[\"'][^\"']*[\"']|[^,}\]\s]+)"
+REDACTED = "[REDACTED]"
+_SECRET_KEY = (
+    r"(?:[a-z0-9]+[_-])*(?:pass(?:word|wd|phrase|code)?|pwd|secret|api[_-]?key|"
+    r"private[_-]?key|access[_-]?token|refresh[_-]?token|token|cookie|set[_-]?cookie|"
+    r"authorization|auth|webhook(?:[_-]?url)?)(?:[_-][a-z0-9]+)*"
 )
-ASSIGNED_SECRET_RE = re.compile(
-    r"(?i)(?P<prefix>\b(?:password|passwd|api[_-]?key|token|auth[_-]?token|"
-    r"access[_-]?token|refresh[_-]?token|authorization|cookie|webhook(?:_url)?)\b\s*=\s*)"
-    r"(?P<value>[\"'][^\"']*[\"']|[^,;}\]\s]+)"
+_PII_KEY = (
+    r"(?:[a-z0-9]+[_-])*(?:first[_-]?name|last[_-]?name|full[_-]?name|"
+    r"display[_-]?name|email(?:[_-]?address)?|phone(?:[_-]?number)?|"
+    r"mobile(?:[_-]?number)?|street(?:[_-]?address)?|postal[_-]?address|"
+    r"home[_-]?address|birth(?:day|date)|ssn|social[_-]?security(?:[_-]?number)?|"
+    r"card[_-]?number|credit[_-]?card|cvv|cvc)(?:[_-][a-z0-9]+)*"
+)
+_SENSITIVE_KEY = rf"(?:{_SECRET_KEY}|{_PII_KEY})"
+SECRET_KEY_FULL_RE = re.compile(rf"(?i)^{_SECRET_KEY}$")
+PII_KEY_FULL_RE = re.compile(rf"(?i)^{_PII_KEY}$")
+
+SECRET_HEADER_RE = re.compile(r"(?im)^(?P<prefix>\s*(?:authorization|cookie|set-cookie)\s*:\s*).+$")
+AUTHORIZATION_RE = re.compile(r"(?i)\b(?P<scheme>Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
+WEBHOOK_URL_RE = re.compile(r"(?i)https?://[^\s'\"]*(?:webhook|hooks)[^\s'\"]*")
+BARE_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk-[A-Za-z0-9][A-Za-z0-9._-]{7,}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"AIza[A-Za-z0-9_-]{20,}|"
+    r"AKIA[A-Z0-9]{16}"
+    r")(?![A-Za-z0-9])"
+)
+JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\."
+    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+)
+EMAIL_RE = re.compile(r"(?i)(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])")
+IP_ADDRESS_RE = re.compile(
+    r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)" r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
+)
+HOME_PATH_RE = re.compile(r"(?i)(?P<prefix>/(?:home|users)/)[^/\s]+")
+FORMATTED_PHONE_RE = re.compile(
+    r"(?<![\w.])(?:\+\d(?:[\s().-]*\d){6,14}|\d{3}[\s().-]+\d{3}[\s().-]+\d{4})(?![\w.])"
+)
+PHONE_CONTEXT_RE = re.compile(
+    r"(?i)(?P<prefix>\b(?:phone|mobile)(?:\s+number)?\s+(?:is|was)\s*:?\s*)"
+    r"(?P<value>\+?\d(?:[\s().-]*\d){6,14})"
+)
+PERSONAL_NAME_RE = re.compile(
+    r"(?i)(?P<prefix>\bmy\s+(?:full\s+)?name\s+is\s*:?\s*)"
+    r"(?P<value>[A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*){0,4})(?=[.,;\r\n]|$)"
+)
+SENSITIVE_QUOTED_VALUE_RE = re.compile(
+    rf"(?i)(?P<prefix>(?:(?P<key_quote>[\"'])(?P<quoted_key>{_SENSITIVE_KEY})"
+    rf"(?P=key_quote)|(?P<bare_key>\b{_SENSITIVE_KEY}\b))\s*[:=]\s*)"
+    r'(?:(?P<double_quote>")(?P<double_value>(?:\\.|[^"\\])*)"|'
+    r"(?P<single_quote>')(?P<single_value>(?:\\.|[^'\\])*)')"
+)
+SENSITIVE_BARE_VALUE_RE = re.compile(
+    rf"(?i)(?P<prefix>(?:(?P<key_quote>[\"'])(?P<quoted_key>{_SENSITIVE_KEY})"
+    rf"(?P=key_quote)|(?P<bare_key>\b{_SENSITIVE_KEY}\b))\s*[:=]\s*)"
+    r"(?P<value>(?![\[({\"'])[^\s,;()\[\]{}]+)"
+)
+NATURAL_LANGUAGE_SECRET_RE = re.compile(
+    r"(?i)(?P<prefix>\b(?:found\s+)?(?:[a-z0-9_-]+\s+)?"
+    r"(?:pass(?:word|wd|phrase|code)?|pwd|api[_ -]?key|access[_ -]?token|"
+    r"refresh[_ -]?token|auth(?:orization)?|cookie|webhook)"
+    r"(?:\s+(?:is|was)|\s*[:=])\s*)"
+    r"(?:(?P<double_quote>\")(?P<double_value>(?:\\.|[^\"\\])*)\"|"
+    r"(?P<single_quote>')(?P<single_value>(?:\\.|[^'\\])*)'|"
+    r"(?P<bare_value>[^\s,;()\[\]{}]+))"
+)
+_NON_SECRET_LITERAL_VALUES = frozenset(
+    {"", "[redacted]", "none", "null", "string", "true", "false", "bearer", "basic"}
 )
 
 
@@ -503,19 +564,111 @@ def compute_rollout_diagnostics(
     }
 
 
-def _redact_sensitive_text(text: str) -> str:
-    text = SECRET_HEADER_RE.sub(lambda match: match.group("prefix") + "[REDACTED]", text)
-    text = QUOTED_SECRET_RE.sub(lambda match: match.group("prefix") + '"[REDACTED]"', text)
-    return ASSIGNED_SECRET_RE.sub(lambda match: match.group("prefix") + '"[REDACTED]"', text)
+def _sensitive_key(match: re.Match[str]) -> str:
+    return str(match.groupdict().get("quoted_key") or match.groupdict().get("bare_key") or "")
+
+
+def _redaction_for_key(key: str) -> str:
+    normalized = key.lower().replace("-", "_")
+    if SECRET_KEY_FULL_RE.fullmatch(key):
+        return REDACTED
+    if "email" in normalized:
+        return "[REDACTED_EMAIL]"
+    if "phone" in normalized or "mobile" in normalized:
+        return "[REDACTED_PHONE]"
+    if "name" in normalized:
+        return "[REDACTED_NAME]"
+    if any(part in normalized for part in ("address", "street", "birth", "ssn", "social")):
+        return "[REDACTED_PII]"
+    if any(part in normalized for part in ("card", "cvv", "cvc")):
+        return "[REDACTED_PAYMENT]"
+    return REDACTED
+
+
+def _quoted_sensitive_replacement(match: re.Match[str]) -> str:
+    quote = match.group("double_quote") or match.group("single_quote")
+    return f"{match.group('prefix')}{quote}{_redaction_for_key(_sensitive_key(match))}{quote}"
+
+
+def _bare_sensitive_replacement(match: re.Match[str]) -> str:
+    return f'{match.group("prefix")}"{_redaction_for_key(_sensitive_key(match))}"'
+
+
+def _natural_secret_replacement(match: re.Match[str]) -> str:
+    quote = match.group("double_quote") or match.group("single_quote") or ""
+    return f"{match.group('prefix')}{quote}{REDACTED}{quote}"
+
+
+def _literal_value(match: re.Match[str]) -> str:
+    groups = match.groupdict()
+    return str(
+        groups.get("double_value")
+        or groups.get("single_value")
+        or groups.get("bare_value")
+        or groups.get("value")
+        or ""
+    )
+
+
+def _propagatable_sensitive_literal(value: str, *, key: str = "") -> bool:
+    normalized = value.strip().lower()
+    minimum_length = 2 if PII_KEY_FULL_RE.fullmatch(key) else 6
+    return len(value.strip()) >= minimum_length and normalized not in _NON_SECRET_LITERAL_VALUES
+
+
+def _trajectory_sensitive_literals(contents: Sequence[str]) -> tuple[str, ...]:
+    """Collect repeated literal secrets without persisting or logging the registry."""
+    literals: set[str] = set()
+    for content in contents:
+        for match in SENSITIVE_QUOTED_VALUE_RE.finditer(content):
+            value = _literal_value(match)
+            if _propagatable_sensitive_literal(value, key=_sensitive_key(match)):
+                literals.add(value)
+        for match in NATURAL_LANGUAGE_SECRET_RE.finditer(content):
+            value = _literal_value(match)
+            if _propagatable_sensitive_literal(value):
+                literals.add(value)
+        for match in PERSONAL_NAME_RE.finditer(content):
+            literals.add(match.group("value"))
+    return tuple(sorted(literals, key=len, reverse=True))
+
+
+def _replace_sensitive_literal(text: str, literal: str) -> str:
+    escaped = re.escape(literal)
+    if re.fullmatch(r"[A-Za-z0-9_]+", literal):
+        return re.sub(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])", REDACTED, text)
+    return text.replace(literal, REDACTED)
+
+
+def _redact_sensitive_text(text: str, *, sensitive_literals: Sequence[str] = ()) -> str:
+    """Redact credentials and PII while retaining surrounding quotes and delimiters."""
+    for literal in sensitive_literals:
+        text = _replace_sensitive_literal(text, literal)
+    text = SECRET_HEADER_RE.sub(lambda match: match.group("prefix") + REDACTED, text)
+    text = AUTHORIZATION_RE.sub(lambda match: f"{match.group('scheme')} {REDACTED}", text)
+    text = WEBHOOK_URL_RE.sub(REDACTED, text)
+    text = EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    text = IP_ADDRESS_RE.sub("[REDACTED_IP]", text)
+    text = FORMATTED_PHONE_RE.sub("[REDACTED_PHONE]", text)
+    text = PHONE_CONTEXT_RE.sub(lambda match: match.group("prefix") + "[REDACTED_PHONE]", text)
+    text = PERSONAL_NAME_RE.sub(lambda match: match.group("prefix") + "[REDACTED_NAME]", text)
+    text = SENSITIVE_QUOTED_VALUE_RE.sub(_quoted_sensitive_replacement, text)
+    text = SENSITIVE_BARE_VALUE_RE.sub(_bare_sensitive_replacement, text)
+    text = NATURAL_LANGUAGE_SECRET_RE.sub(_natural_secret_replacement, text)
+    text = BARE_CREDENTIAL_RE.sub(REDACTED, text)
+    text = JWT_RE.sub(REDACTED, text)
+    return HOME_PATH_RE.sub(r"\g<prefix>[REDACTED_USER]", text)
 
 
 def _sanitized_messages(rollout: AppWorldTrainingRollout) -> list[dict[str, str]]:
+    contents = [str(getattr(message, "content", "") or "") for message in rollout.messages]
+    sensitive_literals = _trajectory_sensitive_literals(contents)
     return [
         {
             "role": str(getattr(message, "role", "unknown")),
-            "content": _redact_sensitive_text(str(getattr(message, "content", "") or "")),
+            "content": _redact_sensitive_text(content, sensitive_literals=sensitive_literals),
         }
-        for message in rollout.messages
+        for message, content in zip(rollout.messages, contents, strict=True)
     ]
 
 
@@ -568,10 +721,38 @@ def sanitized_trajectory_payload(
 
 def _write_json(path: Path, payload: Any, *, overwrite: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "w" if overwrite else "x"
-    with path.open(mode, encoding="utf-8") as file_handle:
-        json.dump(payload, file_handle, ensure_ascii=False, indent=2, sort_keys=True)
-        file_handle.write("\n")
+    serialized = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            encoding="utf-8",
+            mode="w",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file_handle:
+            temporary_path = Path(file_handle.name)
+            file_handle.write(serialized)
+            file_handle.write("\n")
+            file_handle.flush()
+            os.fsync(file_handle.fileno())
+        temporary_path.chmod(0o600)
+        if overwrite:
+            temporary_path.replace(path)
+        else:
+            path.hardlink_to(temporary_path)
+            temporary_path.unlink()
+        path.chmod(0o600)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def save_sanitized_trajectories(

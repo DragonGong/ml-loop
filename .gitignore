@@ -147,6 +147,12 @@ sandbox/
 
 experiments/
 artifacts/
+/logs/
+/outputs/
+/appworld-results/
+
+# AppWorld task sandboxes can accidentally materialize a literal home path.
+/~/
 
 /.codex_tmp
 

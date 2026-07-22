@@ -8,6 +8,7 @@
 import functools
 import itertools
 import logging
+import os
 from collections.abc import Iterable
 
 import torch
@@ -340,3 +341,25 @@ def setup_mixed_precision_policy(accelerator: Accelerator):
         param_dtype = None
 
     fsdp2_plugin.mixed_precision_policy = MixedPrecisionPolicy(param_dtype, torch.float32, None)
+
+
+def setup_cpu_offload_policy(accelerator: Accelerator) -> None:
+    """Allow WSL launchers to disable FSDP2 pinned CPU parameter storage."""
+    pin_memory_env = os.environ.get("FSDP_OFFLOAD_PIN_MEMORY")
+    if not accelerator.is_fsdp2 or pin_memory_env is None:
+        return
+
+    normalized = pin_memory_env.strip().lower()
+    if normalized not in {"0", "1", "false", "true", "no", "yes"}:
+        raise ValueError(
+            "FSDP_OFFLOAD_PIN_MEMORY must be a boolean value, "
+            f"got {pin_memory_env!r}"
+        )
+    pin_memory = normalized in {"1", "true", "yes"}
+
+    from torch.distributed.fsdp import CPUOffloadPolicy
+
+    fsdp2_plugin = accelerator.state.fsdp_plugin
+    assert isinstance(fsdp2_plugin, FullyShardedDataParallelPlugin)
+    if isinstance(fsdp2_plugin.cpu_offload, CPUOffloadPolicy):
+        fsdp2_plugin.cpu_offload = CPUOffloadPolicy(pin_memory=pin_memory)

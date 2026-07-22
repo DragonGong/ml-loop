@@ -161,6 +161,39 @@ def test_manifest_sampler_rejects_dataset_mismatch(tmp_path: Path) -> None:
         ManifestAppWorldScenarioSampler(manifest_path, dataset_name="dev")
 
 
+def test_manifest_sampler_shards_each_iteration_across_distributed_ranks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path)
+
+    observed_by_rank: list[list[str]] = []
+    for rank in range(2):
+        monkeypatch.setenv("RANK", str(rank))
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        sampler = ManifestAppWorldScenarioSampler(
+            manifest_path,
+            start_iteration=2,
+            cycle=True,
+            distributed_shard=True,
+        )
+        observed_by_rank.append([next(sampler).task_id for _ in range(3)])
+
+    assert observed_by_rank == [["c_1", "e_1", "a_1"], ["d_1", "f_1", "b_1"]]
+
+
+def test_manifest_sampler_rejects_non_divisible_distributed_world_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "3")
+
+    with pytest.raises(ValueError, match="divisible by WORLD_SIZE"):
+        ManifestAppWorldScenarioSampler(manifest_path, distributed_shard=True)
+
+
 def test_r1_launcher_disables_stale_in_process_manifest_restart() -> None:
     launcher = (
         Path(__file__).resolve().parents[1]
