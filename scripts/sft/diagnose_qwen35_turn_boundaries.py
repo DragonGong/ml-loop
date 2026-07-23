@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,7 @@ def _sha256(path: Path) -> str:
 
 
 def _flat_token_ids(value: Any) -> list[int]:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         value = value["input_ids"]
     if hasattr(value, "tolist"):
         value = value.tolist()

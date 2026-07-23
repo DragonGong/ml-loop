@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import UserDict
 from typing import Any
 
 from scripts.sft.audit_qwen35_turn_boundaries import audit_rows, supervised_spans
@@ -19,7 +20,7 @@ class _PromptTokenizer:
         tokenize: bool,
         add_generation_prompt: bool,
         enable_thinking: bool,
-    ) -> list[int]:
+    ) -> UserDict[str, list[int]]:
         assert tokenize is True
         assert enable_thinking is False
         ids = [
@@ -27,7 +28,7 @@ class _PromptTokenizer:
             for message in messages
             for value in (len(message["role"]), len(message["content"]))
         ]
-        return ids + ([91, 92] if add_generation_prompt else [])
+        return UserDict({"input_ids": ids + ([91, 92] if add_generation_prompt else [])})
 
 
 class _BoundaryTokenizer:
