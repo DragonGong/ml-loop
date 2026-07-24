@@ -41,6 +41,10 @@ class _BoundaryTokenizer:
     def convert_tokens_to_ids(self, token: str) -> int:
         return self._ids[token]
 
+    def __call__(self, text: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
+        assert add_special_tokens is False
+        return {"input_ids": [ord(character) for character in text]}
+
     def decode(
         self,
         token_ids: list[int],
@@ -107,6 +111,7 @@ def test_boundary_audit_detects_masked_im_end_after_each_target() -> None:
     assert result["spans_followed_by_im_end"] == 2
     assert result["spans_followed_by_masked_im_end"] == 2
     assert result["<|im_end|>_supervised_count"] == 0
+    assert result["supervised_spans_preceded_by_empty_think"] == 0
     assert result["supervised_assistant_messages_with_multiple_python_blocks"] == 0
     assert result["target_pairs_without_intervening_observation"] == 0
 

@@ -36,6 +36,10 @@ def audit_rows(rows: list[dict[str, Any]], tokenizer: Any) -> dict[str, Any]:
     }
     totals: Counter[str] = Counter()
     next_token_counts: Counter[str] = Counter()
+    totals["supervised_spans_preceded_by_empty_think"] = 0
+    empty_think_ids = list(
+        tokenizer("<think>\n\n</think>\n\n", add_special_tokens=False)["input_ids"]
+    )
     for row in rows:
         input_ids = list(row["input_ids"])
         labels = list(row["labels"])
@@ -57,6 +61,8 @@ def audit_rows(rows: list[dict[str, Any]], tokenizer: Any) -> dict[str, Any]:
             _python_code_block_count(supervised_concat) > 1
         )
         for start, end in spans:
+            if input_ids[max(0, start - len(empty_think_ids)) : start] == empty_think_ids:
+                totals["supervised_spans_preceded_by_empty_think"] += 1
             span_text = tokenizer.decode(
                 input_ids[start:end],
                 skip_special_tokens=False,
@@ -108,6 +114,7 @@ def audit_rows(rows: list[dict[str, Any]], tokenizer: Any) -> dict[str, Any]:
         **dict(totals),
         "next_token_after_supervised_span": dict(next_token_counts),
         "special_token_ids": special_tokens,
+        "empty_think_token_ids": empty_think_ids,
     }
 
 
@@ -291,8 +298,8 @@ def _write_report(
         "",
         "| Stage | Windows | Target messages | Supervised spans | Target multi-block | "
         "No observation between targets | `<|im_end|>` supervised | "
-        "Spans followed by masked `<|im_end|>` |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "Spans followed by masked `<|im_end|>` | Spans preceded by empty think |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for stage in stages:
         stats = stage["boundary_stats"]
@@ -304,6 +311,8 @@ def _write_report(
             f"{stats.get('<|im_end|>_supervised_count', 0)}/"
             f"{stats.get('<|im_end|>_input_count', 0)} | "
             f"{stats.get('spans_followed_by_masked_im_end', 0)}/"
+            f"{stats['supervised_spans']} | "
+            f"{stats.get('supervised_spans_preceded_by_empty_think', 0)}/"
             f"{stats['supervised_spans']} |"
         )
     lines.extend(
